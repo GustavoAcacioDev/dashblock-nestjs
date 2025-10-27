@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  name          String?
+  password      String
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  accounts      accounts[]
+  servers       servers[]
+  sessions      sessions[]
+
+  @@map("users")
+}
+
+model accounts {
+  id                String  @id
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  users             User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model servers {
+  id            String    @id
+  userId        String
+  name          String
+  description   String?
+  agentKey      String    @unique
+  isConnected   Boolean   @default(false)
+  lastSeen      DateTime?
+  sshHost       String?
+  sshPort       Int?      @default(22)
+  sshUsername   String?
+  sshPrivateKey String?
+  minecraftPath String?
+  agentDeployed Boolean   @default(false)
+  serverType    String?
+  mcVersion     String?
+  port          Int?
+  maxPlayers    Int?
+  status        String    @default("offline")
+  playersOnline Int?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime
+  users         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model sessions {
+  id           String   @id
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  users        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
