@@ -7,69 +7,178 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ============================================
+// USER & AUTHENTICATION
+// ============================================
+
 model User {
-  id            String     @id @default(cuid())
-  email         String     @unique
+  id            String    @id @default(cuid())
+  email         String    @unique
   name          String?
   password      String
   emailVerified DateTime?
   image         String?
-  createdAt     DateTime   @default(now())
-  updatedAt     DateTime   @updatedAt
-  accounts      accounts[]
-  servers       servers[]
-  sessions      sessions[]
+
+  // Plan management
+  planType      PlanType  @default(FREE)
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  accounts      Account[]
+  sessions      Session[]
+  instance      RemoteInstance?     // One instance per user
+  servers       MinecraftServer[]   // User's Minecraft servers
 
   @@map("users")
 }
 
-model accounts {
-  id                String  @id
+enum PlanType {
+  FREE      // 3 servers max, 1 running simultaneously
+  PRO       // 10 servers max, 3 running simultaneously
+  PREMIUM   // Unlimited servers, 10 running simultaneously
+}
+
+model Account {
+  id                String  @id @default(cuid())
   userId            String
   type              String
   provider          String
   providerAccountId String
-  refresh_token     String?
-  access_token      String?
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
   expires_at        Int?
   token_type        String?
   scope             String?
-  id_token          String?
+  id_token          String? @db.Text
   session_state     String?
-  users             User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([provider, providerAccountId])
+  @@map("accounts")
 }
 
-model servers {
-  id            String    @id
-  userId        String
-  name          String
-  description   String?
-  agentKey      String    @unique
-  isConnected   Boolean   @default(false)
-  lastSeen      DateTime?
-  sshHost       String?
-  sshPort       Int?      @default(22)
-  sshUsername   String?
-  sshPrivateKey String?
-  minecraftPath String?
-  agentDeployed Boolean   @default(false)
-  serverType    String?
-  mcVersion     String?
-  port          Int?
-  maxPlayers    Int?
-  status        String    @default("offline")
-  playersOnline Int?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime
-  users         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model sessions {
-  id           String   @id
+model Session {
+  id           String   @id @default(cuid())
   sessionToken String   @unique
   userId       String
   expires      DateTime
-  users        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+// ============================================
+// REMOTE INSTANCE (User's Cloud Server)
+// ============================================
+
+model RemoteInstance {
+  id          String   @id @default(cuid())
+  userId      String   @unique // One instance per user
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Instance details
+  name        String   // "My Oracle Server"
+  ipAddress   String
+  sshPort     Int      @default(22)
+  sshUser     String   @default("ubuntu")
+
+  // SSH Authentication (encrypted)
+  sshKeyPath      String?  // Path to uploaded key on OUR server
+  sshPassword     String?  // Encrypted password (fallback)
+
+  // Instance resources (detected from remote)
+  totalRamMb      Int?     // Total RAM on instance (auto-detected)
+  totalCpuCores   Int?     // CPU cores (auto-detected)
+  diskSpaceGb     Int?     // Disk space (auto-detected)
+  osType          String?  // "Ubuntu 22.04", "Oracle Linux 8"
+
+  // Connection status
+  status          InstanceStatus @default(PENDING)
+  lastCheckAt     DateTime?
+  lastErrorMsg    String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  servers     MinecraftServer[]
+
+  @@map("remote_instances")
+}
+
+enum InstanceStatus {
+  PENDING      // User just added, not verified yet
+  CONNECTED    // SSH connection successful
+  ERROR        // Connection failed
+  DISCONNECTED // User removed or SSH credentials invalid
+}
+
+// ============================================
+// MINECRAFT SERVERS
+// ============================================
+
+model MinecraftServer {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  instanceId       String
+  instance         RemoteInstance @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  // Server identification
+  name             String         // "Survival Server"
+  internalName     String @unique // "mc-server-abc123" (systemd service name)
+  description      String?
+
+  // Minecraft configuration
+  version          String         // "1.20.1"
+  type             ServerType     @default(VANILLA)
+
+  // Network configuration
+  gamePort         Int      @unique  // 25565, 25566, etc.
+  rconPort         Int      @unique  // 25575, 25576, etc.
+  rconPassword     String            // Encrypted
+
+  // Resource allocation (user-defined)
+  allocatedRamMb   Int      @default(1024)  // User sets this
+  maxPlayers       Int      @default(20)
+
+  // File system
+  serverPath       String   // "/home/minecraft/servers/{internalName}"
+
+  // Status
+  status           ServerStatus @default(STOPPED)
+  currentPlayers   Int?         // From RCON
+
+  // Timestamps
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  lastStartedAt    DateTime?
+  lastStoppedAt    DateTime?
+
+  @@map("minecraft_servers")
+  @@index([userId])
+  @@index([instanceId])
+  @@index([status])
+}
+
+enum ServerType {
+  VANILLA
+  FABRIC
+  FORGE
+  PAPER
+  SPIGOT
+  PURPUR
+}
+
+enum ServerStatus {
+  STOPPED
+  STARTING
+  RUNNING
+  STOPPING
+  ERROR
 }
