@@ -10,7 +10,10 @@
       "Bash(npx tsc:*)",
       "Bash(dir dist)",
       "Bash(dir:*)",
-      "Bash(npx prisma generate:*)"
+      "Bash(npx prisma generate:*)",
+      "Bash(npx prisma migrate resolve:*)",
+      "Bash(psql:*)",
+      "Bash(npx prisma db push:*)"
     ],
     "deny": [],
     "ask": []

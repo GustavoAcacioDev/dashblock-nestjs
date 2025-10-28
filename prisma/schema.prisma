@@ -87,7 +87,7 @@ model RemoteInstance {
   sshUser     String   @default("ubuntu")
 
   // SSH Authentication (encrypted)
-  sshKeyPath      String?  // Path to uploaded key on OUR server
+  sshKey          String?  @db.Text  // Encrypted SSH private key
   sshPassword     String?  // Encrypted password (fallback)
 
   // Instance resources (detected from remote)

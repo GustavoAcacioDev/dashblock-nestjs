@@ -12,21 +12,16 @@ import { UpdateInstanceDto } from './dto/update-instance.dto';
 import { InstanceResponseDto } from './dto/instance-response.dto';
 import { InstanceStatus } from '@prisma/client';
 import * as crypto from 'crypto';
-import * as fs from 'fs/promises';
-import * as path from 'path';
 
 @Injectable()
 export class InstancesService {
   private readonly logger = new Logger(InstancesService.name);
-  private readonly SSH_KEYS_DIR = path.join(process.cwd(), 'storage', 'ssh-keys');
   private readonly ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
 
   constructor(
     private prisma: PrismaService,
     private sshService: SshService,
-  ) {
-    this.ensureSSHKeysDirectory();
-  }
+  ) {}
 
   /**
    * Create a new remote instance and test connection
@@ -46,12 +41,21 @@ export class InstancesService {
       throw new BadRequestException('Either sshKey or sshPassword must be provided');
     }
 
-    let sshKeyPath: string | null = null;
+    let encryptedSshKey: string | null = null;
     let encryptedPassword: string | null = null;
 
-    // Save SSH key to file if provided
+    // Encrypt SSH key if provided
     if (dto.sshKey) {
-      sshKeyPath = await this.saveSSHKey(userId, dto.sshKey);
+      // Decode if base64, otherwise use as-is
+      let keyContent = dto.sshKey;
+      if (!dto.sshKey.includes('BEGIN')) {
+        try {
+          keyContent = Buffer.from(dto.sshKey, 'base64').toString('utf-8');
+        } catch {
+          // Not base64, use as-is
+        }
+      }
+      encryptedSshKey = this.encrypt(keyContent);
     }
 
     // Encrypt password if provided
@@ -67,7 +71,7 @@ export class InstancesService {
         ipAddress: dto.ipAddress,
         sshPort: dto.sshPort || 22,
         sshUser: dto.sshUser,
-        sshKeyPath,
+        sshKey: encryptedSshKey,
         sshPassword: encryptedPassword,
         status: InstanceStatus.PENDING,
       },
@@ -78,7 +82,7 @@ export class InstancesService {
       host: dto.ipAddress,
       port: dto.sshPort || 22,
       username: dto.sshUser,
-      privateKey: sshKeyPath || undefined,
+      privateKey: dto.sshKey || undefined,
       password: dto.sshPassword,
     });
 
@@ -112,16 +116,21 @@ export class InstancesService {
       throw new NotFoundException('Instance not found');
     }
 
-    let sshKeyPath = instance.sshKeyPath;
+    let encryptedSshKey = instance.sshKey;
     let encryptedPassword = instance.sshPassword;
 
     // Update SSH key if provided
     if (dto.sshKey) {
-      // Delete old key
-      if (instance.sshKeyPath) {
-        await this.deleteSSHKey(instance.sshKeyPath);
+      // Decode if base64, otherwise use as-is
+      let keyContent = dto.sshKey;
+      if (!dto.sshKey.includes('BEGIN')) {
+        try {
+          keyContent = Buffer.from(dto.sshKey, 'base64').toString('utf-8');
+        } catch {
+          // Not base64, use as-is
+        }
       }
-      sshKeyPath = await this.saveSSHKey(userId, dto.sshKey);
+      encryptedSshKey = this.encrypt(keyContent);
     }
 
     // Update password if provided
@@ -136,19 +145,22 @@ export class InstancesService {
         ipAddress: dto.ipAddress ?? instance.ipAddress,
         sshPort: dto.sshPort ?? instance.sshPort,
         sshUser: dto.sshUser ?? instance.sshUser,
-        sshKeyPath,
+        sshKey: encryptedSshKey,
         sshPassword: encryptedPassword,
         status: InstanceStatus.PENDING, // Re-test connection
       },
     });
 
     // Re-test connection with new credentials
+    const plainSshKey = dto.sshKey || (instance.sshKey ? this.decrypt(instance.sshKey) : undefined);
+    const plainPassword = dto.sshPassword || (instance.sshPassword ? this.decrypt(instance.sshPassword) : undefined);
+
     this.testAndUpdateInstance(updated.id, {
       host: updated.ipAddress,
       port: updated.sshPort,
       username: updated.sshUser,
-      privateKey: sshKeyPath || undefined,
-      password: dto.sshPassword,
+      privateKey: plainSshKey,
+      password: plainPassword,
     });
 
     return new InstanceResponseDto(updated);
@@ -172,11 +184,6 @@ export class InstancesService {
       throw new ConflictException(
         `Cannot delete instance with ${instance.servers.length} server(s). Delete all servers first.`,
       );
-    }
-
-    // Delete SSH key file
-    if (instance.sshKeyPath) {
-      await this.deleteSSHKey(instance.sshKeyPath);
     }
 
     // Close SSH connection
@@ -206,7 +213,7 @@ export class InstancesService {
       host: instance.ipAddress,
       port: instance.sshPort,
       username: instance.sshUser,
-      privateKey: instance.sshKeyPath || undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
       password: instance.sshPassword ? this.decrypt(instance.sshPassword) : undefined,
     });
 
@@ -274,52 +281,6 @@ export class InstancesService {
           lastCheckAt: new Date(),
         },
       });
-    }
-  }
-
-  /**
-   * Save SSH key to file
-   */
-  private async saveSSHKey(userId: string, sshKey: string): Promise<string> {
-    const fileName = `${userId}-${Date.now()}.key`;
-    const filePath = path.join(this.SSH_KEYS_DIR, fileName);
-
-    // Decode if base64, otherwise use as-is
-    let keyContent = sshKey;
-    if (!sshKey.includes('BEGIN')) {
-      try {
-        keyContent = Buffer.from(sshKey, 'base64').toString('utf-8');
-      } catch {
-        // Not base64, use as-is
-      }
-    }
-
-    await fs.writeFile(filePath, keyContent, { mode: 0o600 });
-    this.logger.log(`SSH key saved for user ${userId}`);
-
-    return filePath;
-  }
-
-  /**
-   * Delete SSH key file
-   */
-  private async deleteSSHKey(keyPath: string): Promise<void> {
-    try {
-      await fs.unlink(keyPath);
-      this.logger.log(`SSH key deleted: ${keyPath}`);
-    } catch (error) {
-      this.logger.warn(`Failed to delete SSH key ${keyPath}: ${error.message}`);
-    }
-  }
-
-  /**
-   * Ensure SSH keys directory exists
-   */
-  private async ensureSSHKeysDirectory(): Promise<void> {
-    try {
-      await fs.mkdir(this.SSH_KEYS_DIR, { recursive: true });
-    } catch (error) {
-      this.logger.error(`Failed to create SSH keys directory: ${error.message}`);
     }
   }
 

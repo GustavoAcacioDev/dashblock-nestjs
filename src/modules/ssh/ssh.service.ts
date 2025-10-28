@@ -1,6 +1,5 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Client, ConnectConfig } from 'ssh2';
-import { readFileSync } from 'fs';
 
 interface SSHConnection {
   client: Client;
@@ -12,7 +11,7 @@ interface SSHCredentials {
   host: string;
   port: number;
   username: string;
-  privateKey?: string; // Path to key file
+  privateKey?: string; // SSH private key content (not file path)
   password?: string;
 }
 
@@ -271,11 +270,8 @@ export class SshService implements OnModuleDestroy {
     };
 
     if (credentials.privateKey) {
-      try {
-        config.privateKey = readFileSync(credentials.privateKey, 'utf8');
-      } catch (error) {
-        throw new Error(`Failed to read SSH key: ${error.message}`);
-      }
+      // privateKey is now the actual key content, not a file path
+      config.privateKey = credentials.privateKey;
     } else if (credentials.password) {
       config.password = credentials.password;
     } else {

@@ -140,9 +140,7 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKey
-          ? this.decrypt(instance.sshKey)
-          : undefined,
+        privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
       };
 
       // Create directory structure
@@ -269,7 +267,10 @@ export class ServersService {
       );
       const usesForgeRunSh = forgeRunShCheck.stdout.trim() === 'true';
 
-      const systemdService = this.generateSystemdService(server, usesForgeRunSh);
+      const systemdService = this.generateSystemdService(
+        server,
+        usesForgeRunSh,
+      );
 
       await this.sshService.executeCommand(
         instanceId,
@@ -385,9 +386,7 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKey
-          ? this.decrypt(instance.sshKey)
-          : undefined,
+        privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
       };
 
       // Start systemd service
@@ -505,9 +504,7 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKey
-          ? this.decrypt(instance.sshKey)
-          : undefined,
+        privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
       };
 
       // Stop systemd service
@@ -591,9 +588,7 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKey
-          ? this.decrypt(instance.sshKey)
-          : undefined,
+        privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
       };
 
       // Disable and remove systemd service
@@ -688,9 +683,7 @@ export class ServersService {
       password: instance.sshPassword
         ? this.decrypt(instance.sshPassword)
         : undefined,
-      privateKey: instance.sshKey
-        ? this.decrypt(instance.sshKey)
-        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
     };
 
     try {
@@ -1111,7 +1104,10 @@ view-distance=10
     `.trim();
   }
 
-  private generateSystemdService(server: any, useForgeRunSh: boolean = false): string {
+  private generateSystemdService(
+    server: any,
+    useForgeRunSh: boolean = false,
+  ): string {
     // Determine ExecStart command based on server type
     let execStart: string;
 
@@ -1143,7 +1139,8 @@ WantedBy=multi-user.target
 
   private encrypt(text: string): string {
     const algorithm = 'aes-256-cbc';
-    const encryptionKey = process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
+    const encryptionKey =
+      process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
     // Use scrypt to derive a proper 32-byte key from any length string
     const key = crypto.scryptSync(encryptionKey, 'salt', 32);
     const iv = crypto.randomBytes(16);
@@ -1155,7 +1152,8 @@ WantedBy=multi-user.target
 
   private decrypt(text: string): string {
     const algorithm = 'aes-256-cbc';
-    const encryptionKey = process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
+    const encryptionKey =
+      process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
     // Use scrypt to derive a proper 32-byte key from any length string
     const key = crypto.scryptSync(encryptionKey, 'salt', 32);
     const parts = text.split(':');
