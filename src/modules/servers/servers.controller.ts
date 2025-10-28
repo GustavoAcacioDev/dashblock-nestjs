@@ -1,17 +1,26 @@
 import {
   Controller,
   Get,
+  Post,
+  Body,
+  Patch,
+  Param,
+  Delete,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
+import { ServersService } from './servers.service';
 import { PlanLimitsService } from './services/plan-limits.service';
+import { CreateServerDto } from './dto/create-server.dto';
+import { UpdateServerDto } from './dto/update-server.dto';
 import { ResponseHelper } from '../../common/helpers/response.helper';
 
 @Controller('servers')
 @UseGuards(JwtAuthGuard)
 export class ServersController {
   constructor(
+    private readonly serversService: ServersService,
     private readonly planLimitsService: PlanLimitsService,
   ) {}
 
@@ -38,6 +47,133 @@ export class ServersController {
     try {
       const plans = this.planLimitsService.getAllPlanConfigs();
       return ResponseHelper.success(plans);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Create a new Minecraft server
+   * POST /servers
+   */
+  @Post()
+  async create(
+    @CurrentUser('id') userId: string,
+    @Body() createServerDto: CreateServerDto,
+  ) {
+    try {
+      const server = await this.serversService.create(userId, createServerDto);
+      return ResponseHelper.success(server, [
+        'Server created successfully. Setup in progress...',
+      ]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get all servers for the current user
+   * GET /servers
+   */
+  @Get()
+  async findAll(@CurrentUser('id') userId: string) {
+    try {
+      const servers = await this.serversService.findAll(userId);
+      return ResponseHelper.success(servers);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get a specific server
+   * GET /servers/:id
+   */
+  @Get(':id')
+  async findOne(@CurrentUser('id') userId: string, @Param('id') id: string) {
+    try {
+      const server = await this.serversService.findOne(userId, id);
+      return ResponseHelper.success(server);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Start a server
+   * POST /servers/:id/start
+   */
+  @Post(':id/start')
+  async start(@CurrentUser('id') userId: string, @Param('id') id: string) {
+    try {
+      const server = await this.serversService.start(userId, id);
+      return ResponseHelper.success(server, ['Server starting...']);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Stop a server
+   * POST /servers/:id/stop
+   */
+  @Post(':id/stop')
+  async stop(@CurrentUser('id') userId: string, @Param('id') id: string) {
+    try {
+      const server = await this.serversService.stop(userId, id);
+      return ResponseHelper.success(server, ['Server stopping...']);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Update server configuration
+   * PATCH /servers/:id
+   */
+  @Patch(':id')
+  async update(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Body() updateServerDto: UpdateServerDto,
+  ) {
+    try {
+      const server = await this.serversService.update(
+        userId,
+        id,
+        updateServerDto,
+      );
+      return ResponseHelper.success(server, ['Server updated successfully']);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Delete a server
+   * DELETE /servers/:id
+   */
+  @Delete(':id')
+  async remove(@CurrentUser('id') userId: string, @Param('id') id: string) {
+    try {
+      await this.serversService.remove(userId, id);
+      return ResponseHelper.success(null, [
+        'Server deleted successfully. Cleanup in progress...',
+      ]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get server logs and debug info
+   * GET /servers/:id/logs
+   */
+  @Get(':id/logs')
+  async getLogs(@CurrentUser('id') userId: string, @Param('id') id: string) {
+    try {
+      const logs = await this.serversService.getServerLogs(userId, id);
+      return ResponseHelper.success(logs);
     } catch (error) {
       return ResponseHelper.error([error.message]);
     }
