@@ -5,7 +5,12 @@
       "Bash(npx prisma migrate reset:*)",
       "Bash(set PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION=yes)",
       "Bash(npm install:*)",
-      "Bash(npm run build:*)"
+      "Bash(npm run build:*)",
+      "Bash(npx nest build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(dir dist)",
+      "Bash(dir:*)",
+      "Bash(npx prisma generate:*)"
     ],
     "deny": [],
     "ask": []
