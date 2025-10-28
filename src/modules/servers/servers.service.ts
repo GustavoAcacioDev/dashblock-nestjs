@@ -15,6 +15,7 @@ import { UpdateServerDto } from './dto/update-server.dto';
 import { ServerResponseDto } from './dto/server-response.dto';
 import { ServerStatus } from '@prisma/client';
 import * as crypto from 'crypto';
+import axios from 'axios';
 
 @Injectable()
 export class ServersService {
@@ -150,53 +151,70 @@ export class ServersService {
       );
       this.logger.log(`Created directory: ${server.serverPath}`);
 
-      // Download server JAR based on type and version
-      const downloadUrl = this.getServerDownloadUrl(
+      // Download/Install server based on type
+      let downloadUrl = this.getServerDownloadUrl(
         server.type,
         server.version,
       );
 
-      this.logger.log(
-        `Downloading ${server.type} ${server.version} for server ${serverId} from ${downloadUrl}`,
-      );
+      // Handle VANILLA - fetch real URL from Mojang API
+      if (downloadUrl.startsWith('VANILLA:')) {
+        downloadUrl = await this.getVanillaDownloadUrl(server.version);
+      }
 
-      // Try curl first (more common on Oracle Linux), fallback to wget
-      const downloadCommand = `cd ${server.serverPath} && (curl -L -o server.jar "${downloadUrl}" || wget -O server.jar "${downloadUrl}") 2>&1`;
-
-      this.logger.log(`Download command: ${downloadCommand}`);
-
-      const downloadResult = await this.sshService.executeCommand(
-        instanceId,
-        credentials,
-        downloadCommand,
-      );
-
-      this.logger.log(
-        `Download result stdout: ${downloadResult.stdout}`,
-      );
-
-      if (downloadResult.stderr) {
-        this.logger.warn(
-          `Download result stderr: ${downloadResult.stderr}`,
+      // Handle FABRIC - run installer
+      if (downloadUrl.startsWith('FABRIC:')) {
+        await this.installFabricServer(
+          instanceId,
+          credentials,
+          server.serverPath,
+          server.version,
         );
+        // Skip normal download process
+      } else {
+        // Normal download process for PAPER, PURPUR, VANILLA
+        this.logger.log(
+          `Downloading ${server.type} ${server.version} for server ${serverId} from ${downloadUrl}`,
+        );
+
+        // Try curl first (more common on Oracle Linux), fallback to wget
+        const downloadCommand = `cd ${server.serverPath} && (curl -L -o server.jar "${downloadUrl}" || wget -O server.jar "${downloadUrl}") 2>&1`;
+
+        this.logger.log(`Download command: ${downloadCommand}`);
+
+        const downloadResult = await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          downloadCommand,
+        );
+
+        this.logger.log(
+          `Download result stdout: ${downloadResult.stdout}`,
+        );
+
+        if (downloadResult.stderr) {
+          this.logger.warn(
+            `Download result stderr: ${downloadResult.stderr}`,
+          );
+        }
+
+        // Verify download succeeded
+        const verifyResult = await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `ls -lh ${server.serverPath}/server.jar && stat -c%s ${server.serverPath}/server.jar`,
+        );
+
+        this.logger.log(`Server JAR verification: ${verifyResult.stdout}`);
+
+        // Check if file is empty
+        const fileSize = parseInt(verifyResult.stdout.split('\n').pop()?.trim() || '0');
+        if (fileSize === 0) {
+          throw new Error('Downloaded server.jar is empty (0 bytes). Download may have failed.');
+        }
+
+        this.logger.log(`Server JAR downloaded successfully: ${fileSize} bytes`);
       }
-
-      // Verify download succeeded
-      const verifyResult = await this.sshService.executeCommand(
-        instanceId,
-        credentials,
-        `ls -lh ${server.serverPath}/server.jar && stat -c%s ${server.serverPath}/server.jar`,
-      );
-
-      this.logger.log(`Server JAR verification: ${verifyResult.stdout}`);
-
-      // Check if file is empty
-      const fileSize = parseInt(verifyResult.stdout.split('\n').pop()?.trim() || '0');
-      if (fileSize === 0) {
-        throw new Error('Downloaded server.jar is empty (0 bytes). Download may have failed.');
-      }
-
-      this.logger.log(`Server JAR downloaded successfully: ${fileSize} bytes`);
 
       // Set proper permissions and ownership
       await this.sshService.executeCommand(
@@ -734,6 +752,18 @@ export class ServersService {
       return `https://api.purpurmc.org/v2/purpur/${version}/latest/download`;
     }
 
+    // VANILLA - Will be fetched from Mojang API (returns placeholder, actual fetch happens async)
+    if (type === 'VANILLA') {
+      // Return placeholder - we'll fetch the real URL in setupServerOnRemote
+      return `VANILLA:${version}`;
+    }
+
+    // FABRIC - Will use installer (returns placeholder, actual install happens async)
+    if (type === 'FABRIC') {
+      // Return placeholder - we'll run Fabric installer in setupServerOnRemote
+      return `FABRIC:${version}`;
+    }
+
     // Spigot - requires BuildTools, not directly downloadable
     if (type === 'SPIGOT') {
       throw new BadRequestException(
@@ -741,22 +771,166 @@ export class ServersService {
       );
     }
 
-    // Vanilla - requires fetching version manifest from Mojang
-    // For now, recommend using PAPER which is vanilla-compatible
-    if (type === 'VANILLA') {
+    // Forge requires installers
+    if (type === 'FORGE') {
       throw new BadRequestException(
-        'VANILLA server type requires additional API calls to Mojang. Please use PAPER instead, which is fully vanilla-compatible and optimized.',
-      );
-    }
-
-    // Fabric and Forge require installers
-    if (type === 'FABRIC' || type === 'FORGE') {
-      throw new BadRequestException(
-        `${type} requires running an installer. This will be supported in a future update. Please use PAPER for now.`,
+        `FORGE requires running an installer. This will be supported in a future update. Please use PAPER or FABRIC for now.`,
       );
     }
 
     throw new BadRequestException(`Server type ${type} is not yet supported`);
+  }
+
+  /**
+   * Fetch VANILLA server download URL from Mojang API
+   */
+  private async getVanillaDownloadUrl(version: string): Promise<string> {
+    try {
+      this.logger.log(`Fetching VANILLA server URL for version ${version} from Mojang API`);
+
+      // 1. Fetch version manifest
+      const manifestResponse = await axios.get(
+        'https://launchermeta.mojang.com/mc/game/version_manifest.json',
+      );
+
+      // 2. Find the requested version
+      const versionData = manifestResponse.data.versions.find(
+        (v: any) => v.id === version,
+      );
+
+      if (!versionData) {
+        throw new BadRequestException(
+          `Vanilla version ${version} not found in Mojang's version manifest`,
+        );
+      }
+
+      this.logger.log(`Found version data for ${version}, fetching download details...`);
+
+      // 3. Fetch version-specific info
+      const versionInfoResponse = await axios.get(versionData.url);
+
+      // 4. Get server JAR URL
+      const serverUrl = versionInfoResponse.data.downloads?.server?.url;
+
+      if (!serverUrl) {
+        throw new BadRequestException(
+          `No server download available for Vanilla version ${version}`,
+        );
+      }
+
+      this.logger.log(`Found VANILLA server URL: ${serverUrl}`);
+      return serverUrl;
+    } catch (error) {
+      this.logger.error(`Failed to fetch VANILLA download URL: ${error.message}`);
+      throw new BadRequestException(
+        `Failed to fetch VANILLA server for version ${version}: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Install and setup FABRIC server
+   */
+  private async installFabricServer(
+    instanceId: string,
+    credentials: any,
+    serverPath: string,
+    version: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Installing FABRIC server for Minecraft ${version}`);
+
+      // Fabric installer version (latest stable)
+      const fabricInstallerVersion = '1.0.1';
+      const fabricInstallerUrl = `https://maven.fabricmc.net/net/fabricmc/fabric-installer/${fabricInstallerVersion}/fabric-installer-${fabricInstallerVersion}.jar`;
+
+      // Download Fabric installer
+      this.logger.log('Downloading Fabric installer...');
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cd ${serverPath} && curl -L -o fabric-installer.jar "${fabricInstallerUrl}"`,
+      );
+
+      // Run Fabric installer
+      this.logger.log('Running Fabric installer...');
+      const installResult = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cd ${serverPath} && java -jar fabric-installer.jar server -mcversion ${version} -downloadMinecraft 2>&1`,
+      );
+
+      this.logger.log(`Fabric installer output: ${installResult.stdout}`);
+
+      // Check what files were created
+      const filesResult = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `ls -lh ${serverPath}/`,
+      );
+      this.logger.log(`Fabric directory contents: ${filesResult.stdout}`);
+
+      // Fabric creates a launch script, we need to use the actual server JAR
+      // The real server is in libraries/net/minecraft/server/{version}/server-{version}.jar
+      // But we should use the fabric-server-launch.jar which handles classpath
+
+      // Check if fabric-server-launch.jar exists
+      const launchJarCheck = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `test -f ${serverPath}/fabric-server-launch.jar && echo "exists" || echo "not found"`,
+      );
+
+      if (launchJarCheck.stdout.trim() === 'exists') {
+        // Use fabric-server-launch.jar (the proper way)
+        await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `cd ${serverPath} && cp fabric-server-launch.jar server.jar`,
+        );
+        this.logger.log('Using fabric-server-launch.jar as server.jar');
+      } else {
+        // Fallback: try to find any fabric server JAR
+        const findJarResult = await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `find ${serverPath} -name "fabric-server-*.jar" -type f | head -1`,
+        );
+
+        const jarPath = findJarResult.stdout.trim();
+        if (jarPath) {
+          await this.sshService.executeCommand(
+            instanceId,
+            credentials,
+            `cp "${jarPath}" ${serverPath}/server.jar`,
+          );
+          this.logger.log(`Using ${jarPath} as server.jar`);
+        } else {
+          throw new Error('Could not find Fabric server JAR after installation');
+        }
+      }
+
+      // Verify server.jar was created
+      const verifyResult = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `ls -lh ${serverPath}/server.jar && file ${serverPath}/server.jar`,
+      );
+
+      this.logger.log(`Fabric server JAR verification: ${verifyResult.stdout}`);
+
+      // Clean up installer
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `rm -f ${serverPath}/fabric-installer.jar`,
+      );
+
+      this.logger.log('Fabric server installation completed');
+    } catch (error) {
+      this.logger.error(`Failed to install Fabric server: ${error.message}`);
+      throw error;
+    }
   }
 
   private generateServerProperties(
