@@ -26,7 +26,7 @@ export class ServersService {
     private sshService: SshService,
     private planLimitsService: PlanLimitsService,
     private portAllocationService: PortAllocationService,
-  ) {}
+  ) { }
 
   /**
    * Create a new Minecraft server
@@ -140,7 +140,9 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKeyPath || undefined,
+        privateKey: instance.sshKey
+          ? this.decrypt(instance.sshKey)
+          : undefined,
       };
 
       // Create directory structure
@@ -152,10 +154,7 @@ export class ServersService {
       this.logger.log(`Created directory: ${server.serverPath}`);
 
       // Download/Install server based on type
-      let downloadUrl = this.getServerDownloadUrl(
-        server.type,
-        server.version,
-      );
+      let downloadUrl = this.getServerDownloadUrl(server.type, server.version);
 
       // Handle VANILLA - fetch real URL from Mojang API
       if (downloadUrl.startsWith('VANILLA:')) {
@@ -171,8 +170,17 @@ export class ServersService {
           server.version,
         );
         // Skip normal download process
+      } else if (downloadUrl.startsWith('FORGE:')) {
+        // Handle FORGE - run installer
+        await this.installForgeServer(
+          instanceId,
+          credentials,
+          server.serverPath,
+          server.version,
+        );
+        // Skip normal download process
       } else {
-        // Normal download process for PAPER, PURPUR, VANILLA
+        // Normal download process for PAPER, PURPUR, VANILLA (not FABRIC or FORGE)
         this.logger.log(
           `Downloading ${server.type} ${server.version} for server ${serverId} from ${downloadUrl}`,
         );
@@ -188,14 +196,10 @@ export class ServersService {
           downloadCommand,
         );
 
-        this.logger.log(
-          `Download result stdout: ${downloadResult.stdout}`,
-        );
+        this.logger.log(`Download result stdout: ${downloadResult.stdout}`);
 
         if (downloadResult.stderr) {
-          this.logger.warn(
-            `Download result stderr: ${downloadResult.stderr}`,
-          );
+          this.logger.warn(`Download result stderr: ${downloadResult.stderr}`);
         }
 
         // Verify download succeeded
@@ -208,12 +212,18 @@ export class ServersService {
         this.logger.log(`Server JAR verification: ${verifyResult.stdout}`);
 
         // Check if file is empty
-        const fileSize = parseInt(verifyResult.stdout.split('\n').pop()?.trim() || '0');
+        const fileSize = parseInt(
+          verifyResult.stdout.split('\n').pop()?.trim() || '0',
+        );
         if (fileSize === 0) {
-          throw new Error('Downloaded server.jar is empty (0 bytes). Download may have failed.');
+          throw new Error(
+            'Downloaded server.jar is empty (0 bytes). Download may have failed.',
+          );
         }
 
-        this.logger.log(`Server JAR downloaded successfully: ${fileSize} bytes`);
+        this.logger.log(
+          `Server JAR downloaded successfully: ${fileSize} bytes`,
+        );
       }
 
       // Set proper permissions and ownership
@@ -251,7 +261,15 @@ export class ServersService {
       );
 
       // Create systemd service
-      const systemdService = this.generateSystemdService(server);
+      // Check if this is a Forge server with run.sh
+      const forgeRunShCheck = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `test -f ${server.serverPath}/.forge_uses_runsh && echo "true" || echo "false"`,
+      );
+      const usesForgeRunSh = forgeRunShCheck.stdout.trim() === 'true';
+
+      const systemdService = this.generateSystemdService(server, usesForgeRunSh);
 
       await this.sshService.executeCommand(
         instanceId,
@@ -268,9 +286,7 @@ export class ServersService {
 
       this.logger.log(`Server ${serverId} setup completed on remote instance`);
     } catch (error) {
-      this.logger.error(
-        `Failed to setup server ${serverId}: ${error.message}`,
-      );
+      this.logger.error(`Failed to setup server ${serverId}: ${error.message}`);
 
       // Update server status to ERROR
       await this.prisma.minecraftServer.update({
@@ -369,7 +385,9 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKeyPath || undefined,
+        privateKey: instance.sshKey
+          ? this.decrypt(instance.sshKey)
+          : undefined,
       };
 
       // Start systemd service
@@ -487,7 +505,9 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKeyPath || undefined,
+        privateKey: instance.sshKey
+          ? this.decrypt(instance.sshKey)
+          : undefined,
       };
 
       // Stop systemd service
@@ -538,7 +558,9 @@ export class ServersService {
 
     // Delete server files on remote (async, don't wait)
     this.deleteServerOnRemote(id).catch((error) => {
-      this.logger.error(`Failed to delete server ${id} on remote: ${error.message}`);
+      this.logger.error(
+        `Failed to delete server ${id} on remote: ${error.message}`,
+      );
     });
 
     // Delete from database
@@ -569,7 +591,9 @@ export class ServersService {
         password: instance.sshPassword
           ? this.decrypt(instance.sshPassword)
           : undefined,
-        privateKey: instance.sshKeyPath || undefined,
+        privateKey: instance.sshKey
+          ? this.decrypt(instance.sshKey)
+          : undefined,
       };
 
       // Disable and remove systemd service
@@ -638,7 +662,10 @@ export class ServersService {
   /**
    * Get server logs and status from remote instance (for debugging)
    */
-  async getServerLogs(userId: string, id: string): Promise<{
+  async getServerLogs(
+    userId: string,
+    id: string,
+  ): Promise<{
     systemdStatus: string;
     systemdLogs: string;
     serverLogs: string;
@@ -661,7 +688,9 @@ export class ServersService {
       password: instance.sshPassword
         ? this.decrypt(instance.sshPassword)
         : undefined,
-      privateKey: instance.sshKeyPath || undefined,
+      privateKey: instance.sshKey
+        ? this.decrypt(instance.sshKey)
+        : undefined,
     };
 
     try {
@@ -771,11 +800,10 @@ export class ServersService {
       );
     }
 
-    // Forge requires installers
+    // FORGE - Will use installer (returns placeholder, actual install happens async)
     if (type === 'FORGE') {
-      throw new BadRequestException(
-        `FORGE requires running an installer. This will be supported in a future update. Please use PAPER or FABRIC for now.`,
-      );
+      // Return placeholder - we'll run Forge installer in setupServerOnRemote
+      return `FORGE:${version}`;
     }
 
     throw new BadRequestException(`Server type ${type} is not yet supported`);
@@ -786,7 +814,9 @@ export class ServersService {
    */
   private async getVanillaDownloadUrl(version: string): Promise<string> {
     try {
-      this.logger.log(`Fetching VANILLA server URL for version ${version} from Mojang API`);
+      this.logger.log(
+        `Fetching VANILLA server URL for version ${version} from Mojang API`,
+      );
 
       // 1. Fetch version manifest
       const manifestResponse = await axios.get(
@@ -804,7 +834,9 @@ export class ServersService {
         );
       }
 
-      this.logger.log(`Found version data for ${version}, fetching download details...`);
+      this.logger.log(
+        `Found version data for ${version}, fetching download details...`,
+      );
 
       // 3. Fetch version-specific info
       const versionInfoResponse = await axios.get(versionData.url);
@@ -821,7 +853,9 @@ export class ServersService {
       this.logger.log(`Found VANILLA server URL: ${serverUrl}`);
       return serverUrl;
     } catch (error) {
-      this.logger.error(`Failed to fetch VANILLA download URL: ${error.message}`);
+      this.logger.error(
+        `Failed to fetch VANILLA download URL: ${error.message}`,
+      );
       throw new BadRequestException(
         `Failed to fetch VANILLA server for version ${version}: ${error.message}`,
       );
@@ -906,7 +940,9 @@ export class ServersService {
           );
           this.logger.log(`Using ${jarPath} as server.jar`);
         } else {
-          throw new Error('Could not find Fabric server JAR after installation');
+          throw new Error(
+            'Could not find Fabric server JAR after installation',
+          );
         }
       }
 
@@ -933,10 +969,132 @@ export class ServersService {
     }
   }
 
-  private generateServerProperties(
-    server: any,
-    rconPassword: string,
-  ): string {
+  /**
+   * Install and setup FORGE server
+   */
+  private async installForgeServer(
+    instanceId: string,
+    credentials: any,
+    serverPath: string,
+    version: string,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Installing FORGE server for Minecraft ${version}`);
+
+      // Map of known Forge versions for common Minecraft versions
+      const forgeVersions: Record<string, string> = {
+        '1.20.1': '47.3.0',
+        '1.20.2': '48.1.0',
+        '1.20.4': '49.1.0',
+        '1.21': '51.0.33',
+        '1.21.1': '52.0.16',
+      };
+
+      const forgeVersion = forgeVersions[version];
+      if (!forgeVersion) {
+        throw new BadRequestException(
+          `Forge version for Minecraft ${version} is not available. Supported versions: ${Object.keys(forgeVersions).join(', ')}`,
+        );
+      }
+
+      // Forge installer URL format
+      const forgeInstallerUrl = `https://maven.minecraftforge.net/net/minecraftforge/forge/${version}-${forgeVersion}/forge-${version}-${forgeVersion}-installer.jar`;
+
+      this.logger.log(`Forge installer URL: ${forgeInstallerUrl}`);
+
+      // Download Forge installer
+      this.logger.log('Downloading Forge installer...');
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cd ${serverPath} && curl -L -o forge-installer.jar "${forgeInstallerUrl}"`,
+      );
+
+      // Run Forge installer in server install mode
+      this.logger.log('Running Forge installer...');
+      const installResult = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cd ${serverPath} && java -jar forge-installer.jar --installServer 2>&1`,
+      );
+
+      this.logger.log(`Forge installer output: ${installResult.stdout}`);
+
+      // Check what files were created
+      const filesResult = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `ls -lh ${serverPath}/`,
+      );
+      this.logger.log(`Forge directory contents: ${filesResult.stdout}`);
+
+      // Forge creates different JAR names depending on the version
+      // Common patterns: forge-{version}-{forgeVersion}.jar, forge-{version}-{forgeVersion}-shim.jar, run.sh
+      // Modern Forge versions use run.sh script, older versions have direct JAR
+
+      // Check for run.sh (modern Forge)
+      const runShCheck = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `test -f ${serverPath}/run.sh && echo "exists" || echo "not found"`,
+      );
+
+      if (runShCheck.stdout.trim() === 'exists') {
+        // Modern Forge with run.sh - create a wrapper script
+        this.logger.log('Using modern Forge with run.sh script');
+
+        // Make run.sh executable
+        await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `chmod +x ${serverPath}/run.sh`,
+        );
+
+        // For systemd, we'll modify the service to use run.sh instead of server.jar
+        // Create a marker file to indicate this is a Forge server with run.sh
+        await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `touch ${serverPath}/.forge_uses_runsh`,
+        );
+
+        this.logger.log('Forge server will use run.sh for startup');
+      } else {
+        // Legacy Forge - find the server JAR
+        const findJarResult = await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `find ${serverPath} -name "forge-*.jar" -o -name "minecraft_server.*.jar" | grep -v installer | head -1`,
+        );
+
+        const jarPath = findJarResult.stdout.trim();
+        if (jarPath) {
+          await this.sshService.executeCommand(
+            instanceId,
+            credentials,
+            `cp "${jarPath}" ${serverPath}/server.jar`,
+          );
+          this.logger.log(`Using ${jarPath} as server.jar`);
+        } else {
+          throw new Error('Could not find Forge server JAR after installation');
+        }
+      }
+
+      // Clean up installer
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `rm -f ${serverPath}/forge-installer.jar ${serverPath}/forge-installer.jar.log`,
+      );
+
+      this.logger.log('Forge server installation completed');
+    } catch (error) {
+      this.logger.error(`Failed to install Forge server: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private generateServerProperties(server: any, rconPassword: string): string {
     return `
 # Minecraft server properties
 server-port=${server.gamePort}
@@ -953,7 +1111,18 @@ view-distance=10
     `.trim();
   }
 
-  private generateSystemdService(server: any): string {
+  private generateSystemdService(server: any, useForgeRunSh: boolean = false): string {
+    // Determine ExecStart command based on server type
+    let execStart: string;
+
+    if (useForgeRunSh) {
+      // Modern Forge servers use run.sh script
+      execStart = `${server.serverPath}/run.sh nogui`;
+    } else {
+      // Standard Java command for all other server types
+      execStart = `/usr/bin/java -Xmx${server.allocatedRamMb}M -Xms${server.allocatedRamMb}M -jar ${server.serverPath}/server.jar nogui`;
+    }
+
     return `
 [Unit]
 Description=Minecraft Server - ${server.name}
@@ -963,7 +1132,7 @@ After=network.target
 Type=simple
 User=${server.instance.sshUser}
 WorkingDirectory=${server.serverPath}
-ExecStart=/usr/bin/java -Xmx${server.allocatedRamMb}M -Xms${server.allocatedRamMb}M -jar ${server.serverPath}/server.jar nogui
+ExecStart=${execStart}
 Restart=on-failure
 RestartSec=10
 
@@ -974,10 +1143,9 @@ WantedBy=multi-user.target
 
   private encrypt(text: string): string {
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || '', 'utf-8').slice(
-      0,
-      32,
-    );
+    const encryptionKey = process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
+    // Use scrypt to derive a proper 32-byte key from any length string
+    const key = crypto.scryptSync(encryptionKey, 'salt', 32);
     const iv = crypto.randomBytes(16);
     const cipher = crypto.createCipheriv(algorithm, key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
@@ -987,10 +1155,9 @@ WantedBy=multi-user.target
 
   private decrypt(text: string): string {
     const algorithm = 'aes-256-cbc';
-    const key = Buffer.from(process.env.ENCRYPTION_KEY || '', 'utf-8').slice(
-      0,
-      32,
-    );
+    const encryptionKey = process.env.ENCRYPTION_KEY || 'default-key-change-in-production';
+    // Use scrypt to derive a proper 32-byte key from any length string
+    const key = crypto.scryptSync(encryptionKey, 'salt', 32);
     const parts = text.split(':');
     const iv = Buffer.from(parts.shift() || '', 'hex');
     const encryptedText = parts.join(':');
