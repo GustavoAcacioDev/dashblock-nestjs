@@ -303,6 +303,7 @@ export class ServersService {
   async findAll(userId: string): Promise<ServerResponseDto[]> {
     const servers = await this.prisma.minecraftServer.findMany({
       where: { userId },
+      include: { instance: true },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -315,6 +316,7 @@ export class ServersService {
   async findOne(userId: string, id: string): Promise<ServerResponseDto> {
     const server = await this.prisma.minecraftServer.findFirst({
       where: { id, userId },
+      include: { instance: true },
     });
 
     if (!server) {
@@ -728,6 +730,52 @@ export class ServersService {
     }
   }
 
+  /**
+   * Get server console output (latest.log)
+   */
+  async getConsole(
+    userId: string,
+    id: string,
+    lines: number = 100,
+  ): Promise<{ logs: string }> {
+    const server = await this.prisma.minecraftServer.findFirst({
+      where: { id, userId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new NotFoundException('Server not found');
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    try {
+      // Get server console logs
+      const logsResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `tail -n ${lines} ${server.serverPath}/logs/latest.log 2>/dev/null || echo "Console logs not available yet. Server may not have started."`,
+      );
+
+      return {
+        logs: logsResult.stdout,
+      };
+    } catch (error) {
+      throw new BadRequestException(
+        `Failed to get console logs: ${error.message}`,
+      );
+    }
+  }
+
   // ========================================
   // HELPER METHODS
   // ========================================
@@ -867,11 +915,22 @@ export class ServersService {
     try {
       this.logger.log(`Installing FABRIC server for Minecraft ${version}`);
 
-      // Fabric installer version (latest stable)
+      // Step 1: Download vanilla Minecraft server JAR first
+      this.logger.log('Downloading vanilla Minecraft server JAR...');
+      const vanillaUrl = await this.getVanillaDownloadUrl(version);
+
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cd ${serverPath} && curl -L -o minecraft_server.${version}.jar "${vanillaUrl}"`,
+      );
+
+      this.logger.log('Vanilla server JAR downloaded');
+
+      // Step 2: Download Fabric installer (use latest version)
       const fabricInstallerVersion = '1.0.1';
       const fabricInstallerUrl = `https://maven.fabricmc.net/net/fabricmc/fabric-installer/${fabricInstallerVersion}/fabric-installer-${fabricInstallerVersion}.jar`;
 
-      // Download Fabric installer
       this.logger.log('Downloading Fabric installer...');
       await this.sshService.executeCommand(
         instanceId,
@@ -879,29 +938,43 @@ export class ServersService {
         `cd ${serverPath} && curl -L -o fabric-installer.jar "${fabricInstallerUrl}"`,
       );
 
-      // Run Fabric installer
+      // Step 3: Run Fabric installer (without -downloadMinecraft since we already have it)
       this.logger.log('Running Fabric installer...');
       const installResult = await this.sshService.executeCommand(
         instanceId,
         credentials,
-        `cd ${serverPath} && java -jar fabric-installer.jar server -mcversion ${version} -downloadMinecraft 2>&1`,
+        `cd ${serverPath} && java -jar fabric-installer.jar server -mcversion ${version} 2>&1`,
       );
 
       this.logger.log(`Fabric installer output: ${installResult.stdout}`);
 
-      // Check what files were created
+      // Step 4: Check what files were created
       const filesResult = await this.sshService.executeCommand(
         instanceId,
         credentials,
-        `ls -lh ${serverPath}/`,
+        `ls -lha ${serverPath}/`,
       );
       this.logger.log(`Fabric directory contents: ${filesResult.stdout}`);
 
-      // Fabric creates a launch script, we need to use the actual server JAR
-      // The real server is in libraries/net/minecraft/server/{version}/server-{version}.jar
-      // But we should use the fabric-server-launch.jar which handles classpath
+      // Step 5: Check the fabric-server-launcher.properties file
+      const propertiesCheck = await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `cat ${serverPath}/fabric-server-launcher.properties 2>/dev/null || echo "not found"`,
+      );
+      this.logger.log(`fabric-server-launcher.properties: ${propertiesCheck.stdout}`);
 
-      // Check if fabric-server-launch.jar exists
+      // Step 6: Update the properties file to point to our minecraft_server jar
+      await this.sshService.executeCommand(
+        instanceId,
+        credentials,
+        `echo "serverJar=minecraft_server.${version}.jar" > ${serverPath}/fabric-server-launcher.properties`,
+      );
+
+      this.logger.log('Updated fabric-server-launcher.properties with correct serverJar path');
+
+      // Step 7: Fabric creates fabric-server-launch.jar which is a wrapper
+      // We need to use it as server.jar
       const launchJarCheck = await this.sshService.executeCommand(
         instanceId,
         credentials,
@@ -909,7 +982,7 @@ export class ServersService {
       );
 
       if (launchJarCheck.stdout.trim() === 'exists') {
-        // Use fabric-server-launch.jar (the proper way)
+        // Copy fabric-server-launch.jar as server.jar
         await this.sshService.executeCommand(
           instanceId,
           credentials,
@@ -917,29 +990,10 @@ export class ServersService {
         );
         this.logger.log('Using fabric-server-launch.jar as server.jar');
       } else {
-        // Fallback: try to find any fabric server JAR
-        const findJarResult = await this.sshService.executeCommand(
-          instanceId,
-          credentials,
-          `find ${serverPath} -name "fabric-server-*.jar" -type f | head -1`,
-        );
-
-        const jarPath = findJarResult.stdout.trim();
-        if (jarPath) {
-          await this.sshService.executeCommand(
-            instanceId,
-            credentials,
-            `cp "${jarPath}" ${serverPath}/server.jar`,
-          );
-          this.logger.log(`Using ${jarPath} as server.jar`);
-        } else {
-          throw new Error(
-            'Could not find Fabric server JAR after installation',
-          );
-        }
+        throw new Error('fabric-server-launch.jar not found after installation');
       }
 
-      // Verify server.jar was created
+      // Step 8: Verify server.jar was created
       const verifyResult = await this.sshService.executeCommand(
         instanceId,
         credentials,
@@ -948,7 +1002,7 @@ export class ServersService {
 
       this.logger.log(`Fabric server JAR verification: ${verifyResult.stdout}`);
 
-      // Clean up installer
+      // Step 9: Clean up installer
       await this.sshService.executeCommand(
         instanceId,
         credentials,

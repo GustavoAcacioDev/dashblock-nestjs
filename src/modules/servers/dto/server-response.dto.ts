@@ -20,6 +20,7 @@ export class ServerResponseDto {
   updatedAt: Date;
   lastStartedAt?: Date | null;
   lastStoppedAt?: Date | null;
+  connectionAddress?: string; // IP:port for Minecraft client
 
   constructor(server: any) {
     this.id = server.id;
@@ -41,6 +42,11 @@ export class ServerResponseDto {
     this.updatedAt = server.updatedAt;
     this.lastStartedAt = server.lastStartedAt;
     this.lastStoppedAt = server.lastStoppedAt;
+
+    // Add connection address if instance data is available
+    if (server.instance) {
+      this.connectionAddress = `${server.instance.ipAddress}:${server.gamePort}`;
+    }
 
     // Exclude sensitive data like rconPassword
   }

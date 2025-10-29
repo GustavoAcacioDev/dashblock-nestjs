@@ -8,3 +8,5 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+.claude
+NEXT_STEPS.md

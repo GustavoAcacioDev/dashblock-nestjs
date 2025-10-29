@@ -7,11 +7,13 @@ import {
   Param,
   Delete,
   UseGuards,
+  Query,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import { ServersService } from './servers.service';
 import { PlanLimitsService } from './services/plan-limits.service';
+import { RconService } from './services/rcon.service';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
 import { ResponseHelper } from '../../common/helpers/response.helper';
@@ -22,6 +24,7 @@ export class ServersController {
   constructor(
     private readonly serversService: ServersService,
     private readonly planLimitsService: PlanLimitsService,
+    private readonly rconService: RconService,
   ) {}
 
   /**
@@ -174,6 +177,66 @@ export class ServersController {
     try {
       const logs = await this.serversService.getServerLogs(userId, id);
       return ResponseHelper.success(logs);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Execute RCON command on a server
+   * POST /servers/:id/command
+   */
+  @Post(':id/command')
+  async executeCommand(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Body('command') command: string,
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      const result = await this.rconService.executeCommand(id, command);
+      return ResponseHelper.success(result);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get current players on a server
+   * GET /servers/:id/players
+   */
+  @Get(':id/players')
+  async getPlayers(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      const players = await this.rconService.getPlayers(id);
+      return ResponseHelper.success(players);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get server console logs (last 100 lines)
+   * GET /servers/:id/console
+   */
+  @Get(':id/console')
+  async getConsole(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('lines') lines?: string,
+  ) {
+    try {
+      const lineCount = lines ? parseInt(lines, 10) : 100;
+      const console = await this.serversService.getConsole(userId, id, lineCount);
+      return ResponseHelper.success(console);
     } catch (error) {
       return ResponseHelper.error([error.message]);
     }

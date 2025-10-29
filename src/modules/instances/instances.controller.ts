@@ -78,4 +78,27 @@ export class InstancesController {
       return ResponseHelper.error([error.message]);
     }
   }
+
+  @Post('kill-all-servers')
+  @HttpCode(HttpStatus.OK)
+  async killAllServers(@CurrentUser('id') userId: string) {
+    try {
+      const result = await this.instancesService.killAllMinecraftServers(userId);
+      return ResponseHelper.success(result, [
+        'All Minecraft server processes have been terminated',
+      ]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  @Get('processes')
+  async getRunningProcesses(@CurrentUser('id') userId: string) {
+    try {
+      const result = await this.instancesService.getRunningProcesses(userId);
+      return ResponseHelper.success(result);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
 }

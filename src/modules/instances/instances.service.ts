@@ -225,6 +225,198 @@ export class InstancesService {
   }
 
   /**
+   * Kill all Java processes (Minecraft servers) on the instance
+   * This will kill ALL Java processes, including unregistered servers
+   */
+  async killAllMinecraftServers(userId: string): Promise<{
+    processesKilled: number;
+    output: string;
+  }> {
+    const instance = await this.prisma.remoteInstance.findUnique({
+      where: { userId },
+    });
+
+    if (!instance) {
+      throw new NotFoundException('Instance not found');
+    }
+
+    if (instance.status !== InstanceStatus.CONNECTED) {
+      throw new BadRequestException(
+        'Instance is not connected. Cannot execute commands.',
+      );
+    }
+
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+    };
+
+    try {
+      // First, list all Java processes to see what we're killing
+      const listResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `ps aux | grep -E 'java.*jar|java.*minecraft' | grep -v grep || echo "No Java processes found"`,
+      );
+
+      this.logger.log(`Java processes found: ${listResult.stdout}`);
+
+      // Kill all Java processes (Minecraft servers)
+      const killResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `sudo pkill -9 java || echo "No Java processes to kill"`,
+      );
+
+      // Count how many were killed by checking again
+      const checkResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `ps aux | grep -E 'java.*jar|java.*minecraft' | grep -v grep | wc -l`,
+      );
+
+      const remainingProcesses = parseInt(checkResult.stdout.trim() || '0', 10);
+      const output = `${listResult.stdout}\n\nKill command output: ${killResult.stdout || 'Success'}`;
+
+      // Update all registered servers to STOPPED status
+      await this.prisma.minecraftServer.updateMany({
+        where: {
+          instanceId: instance.id,
+          status: { in: ['RUNNING', 'STARTING', 'STOPPING'] },
+        },
+        data: {
+          status: 'STOPPED',
+          currentPlayers: null,
+          lastStoppedAt: new Date(),
+        },
+      });
+
+      this.logger.log(
+        `Killed all Java processes on instance ${instance.id}. Remaining: ${remainingProcesses}`,
+      );
+
+      return {
+        processesKilled: remainingProcesses === 0 ? -1 : -1, // We don't know exact count
+        output,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to kill processes on instance ${instance.id}: ${error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to kill server processes: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * Get all running processes on the instance
+   * Returns detailed process information for monitoring
+   */
+  async getRunningProcesses(userId: string): Promise<{
+    totalProcesses: number;
+    javaProcesses: any[];
+    allProcesses: string;
+    systemdServices: string;
+  }> {
+    const instance = await this.prisma.remoteInstance.findUnique({
+      where: { userId },
+    });
+
+    if (!instance) {
+      throw new NotFoundException('Instance not found');
+    }
+
+    if (instance.status !== InstanceStatus.CONNECTED) {
+      throw new BadRequestException(
+        'Instance is not connected. Cannot execute commands.',
+      );
+    }
+
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+    };
+
+    try {
+      // Get all processes sorted by CPU usage
+      const allProcessesResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `ps aux --sort=-%cpu | head -30`,
+      );
+
+      // Get Java processes with detailed info
+      const javaProcessesResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `ps aux | grep java | grep -v grep || echo "No Java processes found"`,
+      );
+
+      // Get systemd services related to Minecraft
+      const systemdResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `sudo systemctl list-units --type=service --state=running | grep -E 'mc-|minecraft' || echo "No Minecraft services found"`,
+      );
+
+      // Parse Java processes into structured data
+      const javaProcesses: any[] = [];
+      const javaLines = javaProcessesResult.stdout.split('\n').filter(line => line.trim());
+
+      for (const line of javaLines) {
+        if (line.includes('No Java processes found')) continue;
+
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 11) {
+          javaProcesses.push({
+            user: parts[0],
+            pid: parts[1],
+            cpu: parts[2] + '%',
+            memory: parts[3] + '%',
+            vsz: parts[4],
+            rss: parts[5],
+            tty: parts[6],
+            stat: parts[7],
+            start: parts[8],
+            time: parts[9],
+            command: parts.slice(10).join(' ').substring(0, 200), // Limit command length
+          });
+        }
+      }
+
+      // Count total processes
+      const totalProcesses = allProcessesResult.stdout.split('\n').length - 1;
+
+      this.logger.log(`Retrieved process list from instance ${instance.id}`);
+
+      return {
+        totalProcesses,
+        javaProcesses,
+        allProcesses: allProcessesResult.stdout,
+        systemdServices: systemdResult.stdout,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to get processes from instance ${instance.id}: ${error.message}`,
+      );
+      throw new BadRequestException(
+        `Failed to retrieve process list: ${error.message}`,
+      );
+    }
+  }
+
+  /**
    * Test connection and update instance with system info
    */
   private async testAndUpdateInstance(
