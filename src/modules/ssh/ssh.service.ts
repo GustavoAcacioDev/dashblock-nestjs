@@ -11,7 +11,7 @@ interface SSHCredentials {
   host: string;
   port: number;
   username: string;
-  privateKey?: string; // SSH private key content (not file path)
+  privateKey?: string;
   password?: string;
 }
 

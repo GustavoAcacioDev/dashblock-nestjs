@@ -555,12 +555,16 @@ export class ServersService {
       );
     }
 
-    // Delete server files on remote (async, don't wait)
-    this.deleteServerOnRemote(id).catch((error) => {
+    // Delete server files on remote BEFORE deleting from database
+    try {
+      await this.deleteServerOnRemote(server);
+      this.logger.log(`Successfully cleaned up server ${id} on remote instance`);
+    } catch (error) {
       this.logger.error(
-        `Failed to delete server ${id} on remote: ${error.message}`,
+        `Failed to delete server ${id} on remote: ${error.message}. Proceeding with database deletion anyway.`,
       );
-    });
+      // Continue with database deletion even if remote cleanup fails
+    }
 
     // Delete from database
     await this.prisma.minecraftServer.delete({
@@ -573,58 +577,91 @@ export class ServersService {
   /**
    * Delete server files and systemd service on remote
    */
-  private async deleteServerOnRemote(serverId: string): Promise<void> {
+  private async deleteServerOnRemote(server: any): Promise<void> {
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    this.logger.log(`Cleaning up server ${server.id} on remote instance...`);
+
+    // Stop server if it's somehow still running
     try {
-      const server = await this.prisma.minecraftServer.findUnique({
-        where: { id: serverId },
-        include: { instance: true },
-      });
-
-      if (!server) return;
-
-      const instance = server.instance;
-      const credentials = {
-        host: instance.ipAddress,
-        port: instance.sshPort,
-        username: instance.sshUser,
-        password: instance.sshPassword
-          ? this.decrypt(instance.sshPassword)
-          : undefined,
-        privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
-      };
-
-      // Disable and remove systemd service
       await this.sshService.executeCommand(
         instance.id,
         credentials,
-        `sudo systemctl disable ${server.internalName}.service || true`,
+        `sudo systemctl stop ${server.internalName}.service 2>/dev/null || true`,
       );
+    } catch (e) {
+      this.logger.warn(`Could not stop service ${server.internalName}: ${e.message}`);
+    }
 
+    // Disable and remove systemd service
+    try {
+      await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `sudo systemctl disable ${server.internalName}.service 2>/dev/null || true`,
+      );
+    } catch (e) {
+      this.logger.warn(`Could not disable service ${server.internalName}: ${e.message}`);
+    }
+
+    // Remove systemd service file
+    try {
       await this.sshService.executeCommand(
         instance.id,
         credentials,
         `sudo rm -f /etc/systemd/system/${server.internalName}.service`,
       );
+    } catch (e) {
+      this.logger.warn(`Could not remove service file: ${e.message}`);
+    }
 
+    // Reload systemd
+    try {
       await this.sshService.executeCommand(
         instance.id,
         credentials,
         'sudo systemctl daemon-reload',
       );
+    } catch (e) {
+      this.logger.warn(`Could not reload systemd: ${e.message}`);
+    }
 
-      // Delete server directory
-      await this.sshService.executeCommand(
+    // Delete server directory - THIS IS THE CRITICAL PART
+    this.logger.log(`Deleting server directory: ${server.serverPath}`);
+    try {
+      const deleteResult = await this.sshService.executeCommand(
         instance.id,
         credentials,
         `rm -rf ${server.serverPath}`,
       );
 
-      this.logger.log(`Server ${serverId} files deleted from remote instance`);
-    } catch (error) {
-      this.logger.error(
-        `Failed to delete server ${serverId} on remote: ${error.message}`,
+      // Verify deletion
+      const verifyResult = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `test -d ${server.serverPath} && echo "exists" || echo "deleted"`,
       );
+
+      if (verifyResult.stdout.trim() === 'deleted') {
+        this.logger.log(`✓ Server directory ${server.serverPath} successfully deleted`);
+      } else {
+        this.logger.error(`✗ Server directory ${server.serverPath} still exists after deletion attempt`);
+      }
+    } catch (e) {
+      this.logger.error(`Failed to delete server directory ${server.serverPath}: ${e.message}`);
+      throw e;
     }
+
+    this.logger.log(`Server ${server.id} cleanup completed on remote instance`);
   }
 
   /**
