@@ -232,12 +232,19 @@ export class ServersService {
       );
       this.logger.log('Set permissions and ownership');
 
-      // Disable SELinux enforcement for the directory (Oracle Linux specific)
-      await this.sshService.executeCommand(
-        instanceId,
-        credentials,
-        `sudo setenforce 0 2>/dev/null || true`,
-      );
+      // Set SELinux context if SELinux is enabled (Oracle Linux, RHEL, CentOS)
+      // This is safer than disabling SELinux entirely
+      try {
+        await this.sshService.executeCommand(
+          instanceId,
+          credentials,
+          `which restorecon >/dev/null 2>&1 && sudo restorecon -Rv ${server.serverPath} 2>/dev/null || true`,
+        );
+        this.logger.log('SELinux context set (if SELinux is enabled)');
+      } catch (e) {
+        // SELinux tools not available or not needed, continue
+        this.logger.warn('Could not set SELinux context (may not be needed)');
+      }
 
       // Accept EULA
       await this.sshService.executeCommand(
