@@ -8,7 +8,11 @@ import {
   Delete,
   UseGuards,
   Query,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
 import {
   ApiTags,
   ApiOperation,
@@ -16,6 +20,7 @@ import {
   ApiBearerAuth,
   ApiParam,
   ApiBody,
+  ApiConsumes,
 } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
@@ -398,6 +403,113 @@ export class ServersController {
       // Browse files
       const result = await this.fileManagementService.browseServerFiles(id, path);
       return ResponseHelper.success(result);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Upload a file to the server
+   * POST /servers/:id/files/upload
+   */
+  @Post(':id/files/upload')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: diskStorage({
+        destination: './uploads',
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          cb(null, uniqueSuffix + '-' + file.originalname);
+        },
+      }),
+      limits: {
+        fileSize: 100 * 1024 * 1024, // 100MB
+      },
+    }),
+  )
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: 'Upload file to server',
+    description: 'Upload mods, plugins, configs, or other files to the server. Max file size: 100MB.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'File uploaded successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          message: 'File uploaded successfully',
+          path: '/home/opc/minecraft/mc-server-xxxx/mods/MyMod-1.0.jar',
+        },
+        messages: ['File uploaded successfully'],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid file or access denied' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server not found' })
+  async uploadFile(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File,
+    @Query('path') destinationPath: string = '.',
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Upload file
+      const result = await this.fileManagementService.uploadFile(
+        id,
+        file,
+        destinationPath,
+      );
+      return ResponseHelper.success(result, [result.message]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Delete a file from the server
+   * DELETE /servers/:id/files
+   */
+  @Delete(':id/files')
+  @ApiOperation({
+    summary: 'Delete file from server',
+    description: 'Delete a file or directory from the server.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'File deleted successfully',
+  })
+  @ApiResponse({ status: 400, description: 'Invalid path or access denied' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server or file not found' })
+  async deleteFile(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('path') filePath: string,
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Delete file
+      const result = await this.fileManagementService.deleteFile(id, filePath);
+      return ResponseHelper.success(result, [result.message]);
     } catch (error) {
       return ResponseHelper.error([error.message]);
     }

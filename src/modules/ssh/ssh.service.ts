@@ -478,6 +478,124 @@ export class SshService implements OnModuleDestroy {
   }
 
   /**
+   * Upload a file to remote server via SFTP
+   *
+   * @param instanceId - The instance identifier
+   * @param credentials - SSH credentials
+   * @param localPath - Path to local file
+   * @param remotePath - Destination path on remote server
+   */
+  async uploadFile(
+    instanceId: string,
+    credentials: SSHCredentials,
+    localPath: string,
+    remotePath: string,
+  ): Promise<void> {
+    const client = await this.getConnection(instanceId, credentials);
+
+    return new Promise((resolve, reject) => {
+      client.sftp((err, sftp) => {
+        if (err) {
+          this.logger.error(`SFTP initialization failed: ${err.message}`);
+          return reject(err);
+        }
+
+        this.logger.log(`Uploading file: ${localPath} → ${remotePath}`);
+
+        sftp.fastPut(localPath, remotePath, (error) => {
+          if (error) {
+            this.logger.error(`File upload failed: ${error.message}`);
+            sftp.end();
+            return reject(error);
+          }
+
+          this.logger.log(`File uploaded successfully: ${remotePath}`);
+          sftp.end();
+          resolve();
+        });
+      });
+    });
+  }
+
+  /**
+   * Download a file from remote server via SFTP
+   *
+   * @param instanceId - The instance identifier
+   * @param credentials - SSH credentials
+   * @param remotePath - Path to remote file
+   * @param localPath - Destination path locally
+   */
+  async downloadFile(
+    instanceId: string,
+    credentials: SSHCredentials,
+    remotePath: string,
+    localPath: string,
+  ): Promise<void> {
+    const client = await this.getConnection(instanceId, credentials);
+
+    return new Promise((resolve, reject) => {
+      client.sftp((err, sftp) => {
+        if (err) {
+          this.logger.error(`SFTP initialization failed: ${err.message}`);
+          return reject(err);
+        }
+
+        this.logger.log(`Downloading file: ${remotePath} → ${localPath}`);
+
+        sftp.fastGet(remotePath, localPath, (error) => {
+          if (error) {
+            this.logger.error(`File download failed: ${error.message}`);
+            sftp.end();
+            return reject(error);
+          }
+
+          this.logger.log(`File downloaded successfully: ${localPath}`);
+          sftp.end();
+          resolve();
+        });
+      });
+    });
+  }
+
+  /**
+   * Delete a file on remote server
+   *
+   * @param instanceId - The instance identifier
+   * @param credentials - SSH credentials
+   * @param remotePath - Path to file to delete
+   */
+  async deleteFile(
+    instanceId: string,
+    credentials: SSHCredentials,
+    remotePath: string,
+  ): Promise<void> {
+    const client = await this.getConnection(instanceId, credentials);
+
+    return new Promise((resolve, reject) => {
+      client.sftp((err, sftp) => {
+        if (err) {
+          this.logger.error(`SFTP initialization failed: ${err.message}`);
+          return reject(err);
+        }
+
+        this.logger.log(`Deleting file: ${remotePath}`);
+
+        sftp.unlink(remotePath, (error) => {
+          if (error) {
+            this.logger.error(`File deletion failed: ${error.message}`);
+            sftp.end();
+            return reject(error);
+          }
+
+          this.logger.log(`File deleted successfully: ${remotePath}`);
+          sftp.end();
+          resolve();
+        });
+      });
+    });
+  }
+
+  /**
    * Close connection for a specific instance
    */
   closeConnection(instanceId: string): void {

@@ -14,7 +14,13 @@
       "Bash(npx prisma migrate resolve:*)",
       "Bash(psql:*)",
       "Bash(npx prisma db push:*)",
-      "Bash(node -e \"console.log(''JWT_SECRET='' + require(''crypto'').randomBytes(32).toString(''hex'')); console.log(''ENCRYPTION_KEY='' + require(''crypto'').randomBytes(32).toString(''hex''))\")"
+      "Bash(node -e \"console.log(''JWT_SECRET='' + require(''crypto'').randomBytes(32).toString(''hex'')); console.log(''ENCRYPTION_KEY='' + require(''crypto'').randomBytes(32).toString(''hex''))\")",
+      "Bash(npm run start:dev:*)",
+      "Bash(timeout:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(powershell:*)",
+      "Bash(Select-Object -Property LocalPort,OwningProcess)"
     ],
     "deny": [],
     "ask": []
