@@ -23,11 +23,11 @@ export class ServerMonitorService {
     this.logger.log('Starting server status monitoring...');
 
     try {
-      // Get all servers that should be checked (not STOPPED or ERROR)
+      // Get all servers (including STOPPED ones to detect manual starts)
       const servers = await this.prisma.minecraftServer.findMany({
         where: {
           status: {
-            in: [ServerStatus.RUNNING, ServerStatus.STARTING, ServerStatus.STOPPING],
+            not: ServerStatus.ERROR, // Only skip ERROR status servers
           },
         },
         include: {
@@ -46,6 +46,22 @@ export class ServerMonitorService {
     } catch (error) {
       this.logger.error(`Server monitoring failed: ${error.message}`);
     }
+  }
+
+  /**
+   * Manually check a specific server's status (for on-demand checks)
+   */
+  async checkSpecificServer(serverId: string): Promise<void> {
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new Error('Server not found');
+    }
+
+    await this.checkServerStatus(server);
   }
 
   /**
@@ -85,27 +101,42 @@ export class ServerMonitorService {
       // Determine new status
       let newStatus: ServerStatus;
       if (isRunning) {
+        // Server is running
         newStatus = ServerStatus.RUNNING;
       } else if (server.status === ServerStatus.STARTING) {
-        // Still starting, don't change
+        // Still starting, don't change yet
         newStatus = ServerStatus.STARTING;
       } else if (server.status === ServerStatus.STOPPING) {
         // Stopped successfully
         newStatus = ServerStatus.STOPPED;
       } else {
-        // Was running but now stopped unexpectedly
+        // Was running but now stopped, or already stopped
         newStatus = ServerStatus.STOPPED;
       }
 
       // Update status if changed
       if (server.status !== newStatus) {
+        const updateData: any = {
+          status: newStatus,
+        };
+
+        // If transitioning to RUNNING, update lastStartedAt
+        if (newStatus === ServerStatus.RUNNING && server.status === ServerStatus.STOPPED) {
+          updateData.lastStartedAt = new Date();
+          this.logger.log(
+            `Detected manually started server: ${server.name} (${server.id})`,
+          );
+        }
+
+        // If transitioning to STOPPED, update lastStoppedAt
+        if (newStatus === ServerStatus.STOPPED && server.status !== ServerStatus.STOPPED) {
+          updateData.lastStoppedAt = new Date();
+          updateData.currentPlayers = null;
+        }
+
         await this.prisma.minecraftServer.update({
           where: { id: server.id },
-          data: {
-            status: newStatus,
-            lastStoppedAt:
-              newStatus === ServerStatus.STOPPED ? new Date() : undefined,
-          },
+          data: updateData,
         });
 
         this.logger.log(

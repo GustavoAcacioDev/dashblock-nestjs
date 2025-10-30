@@ -1,16 +1,20 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { Rcon } from 'rcon-client';
 import { PrismaService } from '../../../prisma/prisma.service';
+import { SshService } from '../../ssh/ssh.service';
 import * as crypto from 'crypto';
 
 @Injectable()
 export class RconService {
   private readonly logger = new Logger(RconService.name);
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private sshService: SshService,
+  ) {}
 
   /**
-   * Execute RCON command on a server
+   * Execute RCON command on a server using SSH tunnel
    */
   async executeCommand(
     serverId: string,
@@ -30,12 +34,42 @@ export class RconService {
     }
 
     const rconPassword = this.decrypt(server.rconPassword);
+    const instance = server.instance;
+
+    // Build SSH credentials
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    let tunnel;
 
     try {
+      // Create SSH tunnel to RCON port
+      this.logger.log(
+        `Creating SSH tunnel for RCON on server ${server.name} (${server.rconPort})`,
+      );
+      tunnel = await this.sshService.createPortForward(
+        instance.id,
+        credentials,
+        server.rconPort,
+      );
+
+      this.logger.log(
+        `SSH tunnel established: localhost:${tunnel.localPort} → remote:${server.rconPort}`,
+      );
+
+      // Connect RCON through the tunnel (to localhost)
       const rcon = await Rcon.connect({
-        host: server.instance.ipAddress,
-        port: server.rconPort,
+        host: '127.0.0.1',
+        port: tunnel.localPort,
         password: rconPassword,
+        timeout: 10000, // 10 second timeout
       });
 
       this.logger.log(`Executing RCON command on ${server.name}: ${command}`);
@@ -51,6 +85,12 @@ export class RconService {
       throw new BadRequestException(
         `Failed to execute RCON command: ${error.message}`,
       );
+    } finally {
+      // Always close the tunnel
+      if (tunnel) {
+        this.logger.log(`Closing SSH tunnel on port ${tunnel.localPort}`);
+        tunnel.close();
+      }
     }
   }
 

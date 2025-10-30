@@ -21,6 +21,11 @@ interface CommandResult {
   exitCode: number;
 }
 
+interface PortForwardTunnel {
+  localPort: number;
+  close: () => void;
+}
+
 @Injectable()
 export class SshService implements OnModuleDestroy {
   private readonly logger = new Logger(SshService.name);
@@ -279,6 +284,81 @@ export class SshService implements OnModuleDestroy {
     }
 
     return config;
+  }
+
+  /**
+   * Create SSH port forwarding tunnel
+   * This allows connecting to a remote port as if it were local
+   *
+   * @param instanceId - The instance identifier
+   * @param credentials - SSH credentials
+   * @param remotePort - The port on the remote server to forward
+   * @returns Object with local port and close function
+   */
+  async createPortForward(
+    instanceId: string,
+    credentials: SSHCredentials,
+    remotePort: number,
+  ): Promise<PortForwardTunnel> {
+    const client = await this.getConnection(instanceId, credentials);
+
+    return new Promise((resolve, reject) => {
+      // Use a random available port on localhost
+      const net = require('net');
+      const server = net.createServer();
+
+      server.listen(0, '127.0.0.1', () => {
+        const localPort = server.address().port;
+        this.logger.debug(
+          `Port forwarding: localhost:${localPort} → ${credentials.host}:${remotePort}`,
+        );
+
+        server.on('connection', (socket) => {
+          // Forward the connection through SSH to remote localhost:remotePort
+          client.forwardOut(
+            '127.0.0.1',
+            localPort,
+            '127.0.0.1', // Connect to localhost on remote (where RCON listens)
+            remotePort,
+            (err, stream) => {
+              if (err) {
+                this.logger.error(
+                  `Port forward error: ${err.message}`,
+                );
+                socket.end();
+                return;
+              }
+
+              // Pipe the socket through the SSH tunnel
+              socket.pipe(stream).pipe(socket);
+
+              socket.on('error', (error) => {
+                this.logger.error(`Socket error: ${error.message}`);
+              });
+
+              stream.on('error', (error) => {
+                this.logger.error(`Stream error: ${error.message}`);
+              });
+            },
+          );
+        });
+
+        const closeTunnel = () => {
+          this.logger.debug(`Closing port forward tunnel on port ${localPort}`);
+          server.close();
+        };
+
+        resolve({
+          localPort,
+          close: closeTunnel,
+        });
+      });
+
+      server.on('error', (err) => {
+        this.logger.error(`Failed to create port forward: ${err.message}`);
+        reject(err);
+      });
+    });
   }
 
   /**
