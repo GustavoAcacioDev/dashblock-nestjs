@@ -5,6 +5,7 @@ import { PlanLimitsService } from './services/plan-limits.service';
 import { PortAllocationService } from './services/port-allocation.service';
 import { ServerMonitorService } from './services/server-monitor.service';
 import { RconService } from './services/rcon.service';
+import { FileManagementService } from './services/file-management.service';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { SshModule } from '../ssh/ssh.module';
 
@@ -17,6 +18,7 @@ import { SshModule } from '../ssh/ssh.module';
     PortAllocationService,
     ServerMonitorService,
     RconService,
+    FileManagementService,
   ],
   exports: [
     ServersService,
@@ -24,6 +26,7 @@ import { SshModule } from '../ssh/ssh.module';
     PortAllocationService,
     ServerMonitorService,
     RconService,
+    FileManagementService,
   ],
 })
 export class ServersModule {}

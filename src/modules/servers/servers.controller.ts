@@ -23,9 +23,11 @@ import { ServersService } from './servers.service';
 import { PlanLimitsService } from './services/plan-limits.service';
 import { RconService } from './services/rcon.service';
 import { ServerMonitorService } from './services/server-monitor.service';
+import { FileManagementService } from './services/file-management.service';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
 import { ExecuteCommandDto } from './dto/execute-command.dto';
+import { FileBrowserResponseDto } from './dto/file-entry.dto';
 import { ResponseHelper } from '../../common/helpers/response.helper';
 
 @ApiTags('Minecraft Servers')
@@ -38,6 +40,7 @@ export class ServersController {
     private readonly planLimitsService: PlanLimitsService,
     private readonly rconService: RconService,
     private readonly serverMonitorService: ServerMonitorService,
+    private readonly fileManagementService: FileManagementService,
   ) {}
 
   /**
@@ -336,6 +339,65 @@ export class ServersController {
       // Return updated server
       const server = await this.serversService.findOne(userId, id);
       return ResponseHelper.success(server, ['Server status refreshed']);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Browse server files and directories
+   * GET /servers/:id/files/browse
+   */
+  @Get(':id/files/browse')
+  @ApiOperation({
+    summary: 'Browse server files',
+    description: 'List files and directories in the server. Navigate through mods, plugins, config, world, etc.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Directory listing retrieved successfully',
+    type: FileBrowserResponseDto,
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          current_path: '/home/opc/minecraft/mc-server-xxxx/mods',
+          entries: [
+            {
+              name: 'MyMod-1.0.jar',
+              is_directory: false,
+              permissions: '-rw-r--r--',
+              size: 1048576,
+              modified: 'Oct 29 12:00',
+            },
+            {
+              name: 'config',
+              is_directory: true,
+              permissions: 'drwxr-xr-x',
+              size: 4096,
+              modified: 'Oct 29 11:00',
+            },
+          ],
+        },
+        messages: [],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid path or access denied' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server not found' })
+  async browseFiles(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('path') path: string = '.',
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Browse files
+      const result = await this.fileManagementService.browseServerFiles(id, path);
+      return ResponseHelper.success(result);
     } catch (error) {
       return ResponseHelper.error([error.message]);
     }

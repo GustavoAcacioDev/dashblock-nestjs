@@ -26,12 +26,27 @@ interface PortForwardTunnel {
   close: () => void;
 }
 
+interface DirectoryCache {
+  data: any;
+  timestamp: number;
+}
+
+interface FileEntry {
+  name: string;
+  is_directory: boolean;
+  permissions: string;
+  size?: number;
+  modified?: string;
+}
+
 @Injectable()
 export class SshService implements OnModuleDestroy {
   private readonly logger = new Logger(SshService.name);
   private readonly connections = new Map<string, SSHConnection>();
+  private readonly directoryCache = new Map<string, DirectoryCache>();
   private readonly CONNECTION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
   private readonly COMMAND_TIMEOUT = 30000; // 30 seconds
+  private readonly CACHE_TTL = 30000; // 30 seconds cache for directory listings
 
   onModuleDestroy() {
     this.logger.log('Closing all SSH connections...');
@@ -359,6 +374,107 @@ export class SshService implements OnModuleDestroy {
         reject(err);
       });
     });
+  }
+
+  /**
+   * List directory contents with caching
+   * Based on Python implementation pattern from directory_navigation.md
+   *
+   * @param instanceId - The instance identifier
+   * @param credentials - SSH credentials
+   * @param path - Path to list (relative or absolute)
+   * @returns Object with current_path and entries array
+   */
+  async listDirectory(
+    instanceId: string,
+    credentials: SSHCredentials,
+    path: string,
+  ): Promise<{ current_path: string; entries: FileEntry[] }> {
+    // Check cache first
+    const cacheKey = `${instanceId}:${path}`;
+    const cached = this.directoryCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && now - cached.timestamp < this.CACHE_TTL) {
+      this.logger.debug(`Cache hit for directory: ${path}`);
+      return cached.data;
+    }
+
+    // Build command: cd to path, get absolute path, list contents
+    let command: string;
+    if (path === '~' || path === '' || !path) {
+      command = 'pwd && ls -la';
+    } else {
+      // Single quotes prevent shell injection
+      command = `cd '${path}' && pwd && ls -la`;
+    }
+
+    try {
+      const result = await this.executeCommand(instanceId, credentials, command);
+
+      if (result.exitCode !== 0) {
+        throw new Error(`Directory listing failed: ${result.stderr}`);
+      }
+
+      // Parse output
+      const lines = result.stdout.trim().split('\n');
+
+      // First line is the current path from pwd
+      const current_path = lines[0]?.trim() || path;
+
+      // Rest of the lines are from ls -la (skip the "total" line)
+      const lsLines = lines.slice(2);
+
+      const entries: FileEntry[] = [];
+
+      for (const line of lsLines) {
+        if (!line.trim()) continue;
+
+        // ls -la format: permissions links owner group size month day time name
+        const parts = line.split(/\s+/);
+        if (parts.length < 9) continue;
+
+        const permissions = parts[0];
+        const size = parseInt(parts[4], 10) || 0;
+        const month = parts[5];
+        const day = parts[6];
+        const time = parts[7];
+        const name = parts.slice(8).join(' '); // Handle spaces in filenames
+
+        // Skip . and .. entries
+        if (name === '.' || name === '..') continue;
+
+        const is_directory = permissions.startsWith('d');
+
+        entries.push({
+          name,
+          is_directory,
+          permissions,
+          size,
+          modified: `${month} ${day} ${time}`,
+        });
+      }
+
+      const resultData = {
+        current_path,
+        entries,
+      };
+
+      // Cache the result
+      this.directoryCache.set(cacheKey, {
+        data: resultData,
+        timestamp: now,
+      });
+
+      this.logger.debug(
+        `Listed directory ${path}: ${entries.length} entries`,
+      );
+
+      return resultData;
+    } catch (error) {
+      this.logger.error(`Failed to list directory ${path}: ${error.message}`);
+      throw error;
+    }
   }
 
   /**
