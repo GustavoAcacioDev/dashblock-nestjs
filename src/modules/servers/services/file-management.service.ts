@@ -12,9 +12,32 @@ export class FileManagementService {
 
   // File upload configuration
   private readonly MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-  private readonly ALLOWED_EXTENSIONS = [
+
+  // SECURITY: Context-aware file type restrictions based on destination
+  private readonly FILE_TYPE_RULES = {
+    // Executable/plugin directories - only JAR files
+    '/mods': ['.jar'],
+    '/plugins': ['.jar'],
+
+    // Config directories - only config files
+    '/config': ['.json', '.toml', '.yml', '.yaml', '.properties', '.txt', '.cfg', '.conf'],
+
+    // Root directory - config files only (server.properties, eula.txt, etc.)
+    '.': ['.json', '.toml', '.yml', '.yaml', '.properties', '.txt', '.cfg', '.conf'],
+
+    // World directories - allow world files
+    '/world': ['.dat', '.mca', '.json', '.txt'],
+    '/world_nether': ['.dat', '.mca', '.json', '.txt'],
+    '/world_the_end': ['.dat', '.mca', '.json', '.txt'],
+
+    // Datapack/resourcepack directories
+    '/datapacks': ['.zip', '.json'],
+    '/resourcepacks': ['.zip'],
+  };
+
+  // Default allowed extensions if path doesn't match specific rules
+  private readonly DEFAULT_ALLOWED_EXTENSIONS = [
     '.jar',
-    '.zip',
     '.json',
     '.toml',
     '.yml',
@@ -29,6 +52,30 @@ export class FileManagementService {
     private prisma: PrismaService,
     private sshService: SshService,
   ) {}
+
+  /**
+   * Get allowed file extensions for a given destination path
+   * SECURITY: Context-aware file type restrictions
+   */
+  private getAllowedExtensions(destinationPath: string): string[] {
+    // Normalize the path
+    const normalizedPath = destinationPath.startsWith('/')
+      ? destinationPath
+      : '/' + destinationPath;
+
+    // Check if path matches any specific rule
+    for (const [rulePath, extensions] of Object.entries(this.FILE_TYPE_RULES)) {
+      if (rulePath === '.' && (destinationPath === '.' || destinationPath === '')) {
+        return extensions;
+      }
+      if (normalizedPath.startsWith(rulePath) || normalizedPath.includes(rulePath)) {
+        return extensions;
+      }
+    }
+
+    // Return default extensions if no specific rule matches
+    return this.DEFAULT_ALLOWED_EXTENSIONS;
+  }
 
   /**
    * Browse files in a server directory
@@ -146,16 +193,19 @@ export class FileManagementService {
       );
     }
 
+    // SECURITY: Get allowed extensions based on destination path
+    const allowedExtensions = this.getAllowedExtensions(destinationPath);
+
     // Check file extension
     const fileExt = path.extname(sanitizedFilename).toLowerCase();
-    if (!this.ALLOWED_EXTENSIONS.includes(fileExt)) {
+    if (!allowedExtensions.includes(fileExt)) {
       try {
         fs.unlinkSync(file.path);
       } catch (err) {
         // Ignore cleanup errors
       }
       throw new BadRequestException(
-        `File type not allowed. Allowed types: ${this.ALLOWED_EXTENSIONS.join(', ')}`,
+        `File type not allowed for this directory. Allowed types: ${allowedExtensions.join(', ')}`,
       );
     }
 
@@ -315,6 +365,297 @@ export class FileManagementService {
   }
 
   /**
+   * Download a file from the server
+   */
+  async downloadFile(
+    serverId: string,
+    filePath: string,
+  ): Promise<{ localPath: string; filename: string; cleanup: () => void }> {
+    if (!filePath || filePath.trim() === '') {
+      throw new BadRequestException('File path is required');
+    }
+
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new BadRequestException('Server not found');
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    // SECURITY FIX: Resolve and normalize path to prevent traversal
+    const relativePath = filePath.startsWith('/')
+      ? filePath.slice(1)
+      : filePath;
+
+    let fullPath = path.posix.join(server.serverPath, relativePath);
+    fullPath = path.posix.normalize(fullPath);
+
+    // Security check: ensure normalized path is within server directory
+    const normalizedServerPath = server.serverPath.endsWith('/')
+      ? server.serverPath.slice(0, -1)
+      : server.serverPath;
+    if (!fullPath.startsWith(normalizedServerPath + '/') && fullPath !== normalizedServerPath) {
+      throw new BadRequestException(
+        'Access denied: Path traversal detected',
+      );
+    }
+
+    // Prevent downloading server root directory
+    if (fullPath === normalizedServerPath) {
+      throw new BadRequestException(
+        'Cannot download server root directory',
+      );
+    }
+
+    try {
+      // Create temp directory if it doesn't exist
+      const tempDir = path.join(process.cwd(), 'downloads');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+
+      // Generate unique temporary filename
+      const filename = path.basename(fullPath);
+      const tempFilename = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}-${filename}`;
+      const localPath = path.join(tempDir, tempFilename);
+
+      // Download via SFTP
+      await this.sshService.downloadFile(
+        instance.id,
+        credentials,
+        fullPath,
+        localPath,
+      );
+
+      this.logger.log(`File downloaded successfully: ${filename}`);
+
+      // Return path and cleanup function
+      return {
+        localPath,
+        filename,
+        cleanup: () => {
+          try {
+            if (fs.existsSync(localPath)) {
+              fs.unlinkSync(localPath);
+              this.logger.log(`Cleaned up temp file: ${tempFilename}`);
+            }
+          } catch (err) {
+            this.logger.warn(`Failed to cleanup temp file: ${err.message}`);
+          }
+        },
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to download file from server ${serverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Failed to download file');
+    }
+  }
+
+  /**
+   * Read file content from the server
+   * Only for text-based files (configs, logs, etc.)
+   */
+  async readFileContent(
+    serverId: string,
+    filePath: string,
+  ): Promise<{ content: string; filename: string }> {
+    if (!filePath || filePath.trim() === '') {
+      throw new BadRequestException('File path is required');
+    }
+
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new BadRequestException('Server not found');
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    // SECURITY: Resolve and normalize path
+    const relativePath = filePath.startsWith('/')
+      ? filePath.slice(1)
+      : filePath;
+
+    let fullPath = path.posix.join(server.serverPath, relativePath);
+    fullPath = path.posix.normalize(fullPath);
+
+    // Security check
+    const normalizedServerPath = server.serverPath.endsWith('/')
+      ? server.serverPath.slice(0, -1)
+      : server.serverPath;
+    if (!fullPath.startsWith(normalizedServerPath + '/') && fullPath !== normalizedServerPath) {
+      throw new BadRequestException(
+        'Access denied: Path traversal detected',
+      );
+    }
+
+    // Validate file extension (only allow text-based files)
+    const fileExt = path.extname(fullPath).toLowerCase();
+    const editableExtensions = [
+      '.properties',
+      '.yml',
+      '.yaml',
+      '.json',
+      '.toml',
+      '.txt',
+      '.cfg',
+      '.conf',
+      '.log',
+    ];
+
+    if (!editableExtensions.includes(fileExt)) {
+      throw new BadRequestException(
+        `File type not editable. Editable types: ${editableExtensions.join(', ')}`,
+      );
+    }
+
+    try {
+      // Read file content via SSH
+      const result = await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `cat "${fullPath}"`,
+      );
+
+      this.logger.log(`File read successfully: ${path.basename(fullPath)}`);
+
+      return {
+        content: result.stdout.trim(),
+        filename: path.basename(fullPath),
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to read file from server ${serverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Failed to read file content');
+    }
+  }
+
+  /**
+   * Write file content to the server
+   * Only for text-based files (configs, etc.)
+   */
+  async writeFileContent(
+    serverId: string,
+    filePath: string,
+    content: string,
+  ): Promise<{ message: string }> {
+    if (!filePath || filePath.trim() === '') {
+      throw new BadRequestException('File path is required');
+    }
+
+    if (content === undefined || content === null) {
+      throw new BadRequestException('File content is required');
+    }
+
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new BadRequestException('Server not found');
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    // SECURITY: Resolve and normalize path
+    const relativePath = filePath.startsWith('/')
+      ? filePath.slice(1)
+      : filePath;
+
+    let fullPath = path.posix.join(server.serverPath, relativePath);
+    fullPath = path.posix.normalize(fullPath);
+
+    // Security check
+    const normalizedServerPath = server.serverPath.endsWith('/')
+      ? server.serverPath.slice(0, -1)
+      : server.serverPath;
+    if (!fullPath.startsWith(normalizedServerPath + '/') && fullPath !== normalizedServerPath) {
+      throw new BadRequestException(
+        'Access denied: Path traversal detected',
+      );
+    }
+
+    // Validate file extension (only allow text-based files)
+    const fileExt = path.extname(fullPath).toLowerCase();
+    const editableExtensions = [
+      '.properties',
+      '.yml',
+      '.yaml',
+      '.json',
+      '.toml',
+      '.txt',
+      '.cfg',
+      '.conf',
+    ];
+
+    if (!editableExtensions.includes(fileExt)) {
+      throw new BadRequestException(
+        `File type not editable. Editable types: ${editableExtensions.join(', ')}`,
+      );
+    }
+
+    try {
+      // Escape content for shell - use base64 encoding to safely transfer content
+      const encodedContent = Buffer.from(content).toString('base64');
+
+      // Write file content via SSH using base64 decode
+      await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `echo "${encodedContent}" | base64 -d > "${fullPath}"`,
+      );
+
+      this.logger.log(`File written successfully: ${path.basename(fullPath)}`);
+
+      return {
+        message: 'File saved successfully',
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to write file to server ${serverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Failed to save file content');
+    }
+  }
+
+  /**
    * Delete a file from the server
    */
   async deleteFile(
@@ -387,6 +728,221 @@ export class FileManagementService {
         `Failed to delete file from server ${serverId}`,
       );
       throw new BadRequestException('Failed to delete file');
+    }
+  }
+
+  /**
+   * Reset server world (delete world folders)
+   */
+  async resetWorld(
+    serverId: string,
+    worldType: 'overworld' | 'nether' | 'end' | 'all' = 'all',
+  ): Promise<{ message: string }> {
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      throw new BadRequestException('Server not found');
+    }
+
+    // Check if server is running
+    if (server.status === 'RUNNING') {
+      throw new BadRequestException(
+        'Server must be stopped before resetting world',
+      );
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    try {
+      let deletePaths: string[] = [];
+
+      switch (worldType) {
+        case 'overworld':
+          deletePaths = [path.posix.join(server.serverPath, 'world')];
+          break;
+        case 'nether':
+          deletePaths = [path.posix.join(server.serverPath, 'world_nether')];
+          break;
+        case 'end':
+          deletePaths = [path.posix.join(server.serverPath, 'world_the_end')];
+          break;
+        case 'all':
+          deletePaths = [
+            path.posix.join(server.serverPath, 'world'),
+            path.posix.join(server.serverPath, 'world_nether'),
+            path.posix.join(server.serverPath, 'world_the_end'),
+          ];
+          break;
+      }
+
+      // Delete world folders
+      for (const worldPath of deletePaths) {
+        const deleteCommand = `rm -rf "${worldPath}"`;
+        await this.sshService.executeCommand(
+          instance.id,
+          credentials,
+          deleteCommand,
+        );
+      }
+
+      this.logger.log(`World reset completed for server ${serverId}: ${worldType}`);
+
+      return {
+        message: `World reset successfully. A new world will be generated on next server start.`,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to reset world for server ${serverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Failed to reset world');
+    }
+  }
+
+  /**
+   * Upload a custom world (zip file)
+   */
+  async uploadWorld(
+    serverId: string,
+    file: Express.Multer.File,
+    worldType: 'overworld' | 'nether' | 'end' = 'overworld',
+  ): Promise<{ message: string }> {
+    if (!file) {
+      throw new BadRequestException('No world file provided');
+    }
+
+    const server = await this.prisma.minecraftServer.findUnique({
+      where: { id: serverId },
+      include: { instance: true },
+    });
+
+    if (!server) {
+      try {
+        fs.unlinkSync(file.path);
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      throw new BadRequestException('Server not found');
+    }
+
+    // Check if server is running
+    if (server.status === 'RUNNING') {
+      try {
+        fs.unlinkSync(file.path);
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      throw new BadRequestException(
+        'Server must be stopped before uploading world',
+      );
+    }
+
+    // Validate file is a zip
+    const fileExt = path.extname(file.originalname).toLowerCase();
+    if (fileExt !== '.zip') {
+      try {
+        fs.unlinkSync(file.path);
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      throw new BadRequestException('World file must be a ZIP archive');
+    }
+
+    const instance = server.instance;
+    const credentials = {
+      host: instance.ipAddress,
+      port: instance.sshPort,
+      username: instance.sshUser,
+      password: instance.sshPassword
+        ? this.decrypt(instance.sshPassword)
+        : undefined,
+      privateKey: instance.sshKey ? this.decrypt(instance.sshKey) : undefined,
+    };
+
+    try {
+      // Determine world folder name
+      let worldFolderName: string;
+      switch (worldType) {
+        case 'overworld':
+          worldFolderName = 'world';
+          break;
+        case 'nether':
+          worldFolderName = 'world_nether';
+          break;
+        case 'end':
+          worldFolderName = 'world_the_end';
+          break;
+      }
+
+      const worldPath = path.posix.join(server.serverPath, worldFolderName);
+      const tempZipPath = path.posix.join(server.serverPath, 'world-upload.zip');
+
+      this.logger.log(`Uploading world file to ${tempZipPath}`);
+
+      // Upload zip file
+      await this.sshService.uploadFile(
+        instance.id,
+        credentials,
+        file.path,
+        tempZipPath,
+      );
+
+      // Delete existing world folder
+      await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `rm -rf "${worldPath}"`,
+      );
+
+      // Create world directory
+      await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `mkdir -p "${worldPath}"`,
+      );
+
+      // Extract zip to world folder
+      await this.sshService.executeCommand(
+        instance.id,
+        credentials,
+        `cd "${worldPath}" && unzip -o "${tempZipPath}" && rm "${tempZipPath}"`,
+      );
+
+      // Clean up local temp file
+      try {
+        fs.unlinkSync(file.path);
+      } catch (err) {
+        this.logger.warn(`Failed to delete temp file: ${err.message}`);
+      }
+
+      this.logger.log(`World uploaded successfully for server ${serverId}`);
+
+      return {
+        message: 'World uploaded successfully. Start the server to use the new world.',
+      };
+    } catch (error) {
+      // Clean up on error
+      try {
+        fs.unlinkSync(file.path);
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+
+      this.logger.error(
+        `Failed to upload world for server ${serverId}: ${error.message}`,
+      );
+      throw new BadRequestException('Failed to upload world');
     }
   }
 

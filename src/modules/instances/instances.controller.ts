@@ -10,7 +10,9 @@ import {
   HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { InstancesService } from './instances.service';
+import { MetricsService } from '../servers/services/metrics.service';
 import { CreateInstanceDto } from './dto/create-instance.dto';
 import { UpdateInstanceDto } from './dto/update-instance.dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
@@ -22,8 +24,12 @@ import { ResponseHelper } from '../../common/helpers/response.helper';
 @Controller('instances')
 @UseGuards(JwtAuthGuard)
 export class InstancesController {
-  constructor(private readonly instancesService: InstancesService) {}
+  constructor(
+    private readonly instancesService: InstancesService,
+    private readonly metricsService: MetricsService,
+  ) {}
 
+  @Throttle({ short: { limit: 3, ttl: 300000 } }) // 3 instance creations per 5 minutes
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Add a remote instance', description: 'Connect a remote server instance via SSH for hosting Minecraft servers' })
@@ -102,6 +108,7 @@ export class InstancesController {
     }
   }
 
+  @Throttle({ short: { limit: 5, ttl: 60000 } }) // 5 kill operations per minute
   @Post('kill-all-servers')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Kill all Minecraft processes', description: 'Force kill all Java/Minecraft server processes on the remote instance' })
@@ -128,6 +135,49 @@ export class InstancesController {
     try {
       const result = await this.instancesService.getRunningProcesses(userId);
       return ResponseHelper.success(result);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  @Get('metrics')
+  @ApiOperation({ summary: 'Get instance performance metrics', description: 'Get overall CPU, memory, disk, and load metrics for the remote instance' })
+  @ApiResponse({
+    status: 200,
+    description: 'Instance metrics retrieved successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          cpuUsage: 35.5,
+          memoryUsedMb: 8192,
+          memoryTotalMb: 16384,
+          memoryUsagePercent: 50,
+          diskUsedGb: 45.2,
+          diskTotalGb: 100,
+          diskUsagePercent: 45.2,
+          runningServers: 3,
+          uptimeSeconds: 86400,
+          loadAverage1m: 1.5,
+          loadAverage5m: 1.2,
+          loadAverage15m: 0.8,
+        },
+        messages: [],
+      },
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Instance not found' })
+  async getInstanceMetrics(@CurrentUser('id') userId: string) {
+    try {
+      const instance = await this.instancesService.findByUserId(userId);
+
+      if (!instance) {
+        return ResponseHelper.error(['No instance configured']);
+      }
+
+      const metrics = await this.metricsService.getInstanceMetrics(instance.id);
+      return ResponseHelper.success(metrics);
     } catch (error) {
       return ResponseHelper.error([error.message]);
     }

@@ -6,11 +6,15 @@ import {
   Patch,
   Param,
   Delete,
+  Put,
   UseGuards,
   Query,
   UseInterceptors,
   UploadedFile,
+  Res,
+  StreamableFile,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import {
@@ -22,6 +26,7 @@ import {
   ApiBody,
   ApiConsumes,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../../auth/decorators/current-user.decorator';
 import { ServersService } from './servers.service';
@@ -29,6 +34,7 @@ import { PlanLimitsService } from './services/plan-limits.service';
 import { RconService } from './services/rcon.service';
 import { ServerMonitorService } from './services/server-monitor.service';
 import { FileManagementService } from './services/file-management.service';
+import { MetricsService } from './services/metrics.service';
 import { CreateServerDto } from './dto/create-server.dto';
 import { UpdateServerDto } from './dto/update-server.dto';
 import { ExecuteCommandDto } from './dto/execute-command.dto';
@@ -46,6 +52,7 @@ export class ServersController {
     private readonly rconService: RconService,
     private readonly serverMonitorService: ServerMonitorService,
     private readonly fileManagementService: FileManagementService,
+    private readonly metricsService: MetricsService,
   ) {}
 
   /**
@@ -80,6 +87,7 @@ export class ServersController {
    * Create a new Minecraft server
    * POST /servers
    */
+  @Throttle({ short: { limit: 3, ttl: 60000 } }) // 3 servers per minute
   @ApiOperation({
     summary: 'Create a new Minecraft server',
     description: 'Creates a new Minecraft server on your remote instance. The server JAR will be downloaded, systemd service created, and server configured automatically. This process runs in the background.',
@@ -241,6 +249,7 @@ export class ServersController {
    * Execute RCON command on a server
    * POST /servers/:id/command
    */
+  @Throttle({ short: { limit: 20, ttl: 60000 } }) // 20 commands per minute
   @Post(':id/command')
   @ApiOperation({
     summary: 'Execute RCON command',
@@ -412,6 +421,7 @@ export class ServersController {
    * Upload a file to the server
    * POST /servers/:id/files/upload
    */
+  @Throttle({ short: { limit: 10, ttl: 60000 } }) // 10 uploads per minute
   @Post(':id/files/upload')
   @UseInterceptors(
     FileInterceptor('file', {
@@ -483,9 +493,173 @@ export class ServersController {
   }
 
   /**
+   * Download a file from the server
+   * GET /servers/:id/files/download
+   */
+  @Throttle({ short: { limit: 10, ttl: 60000 } }) // 10 downloads per minute
+  @Get(':id/files/download')
+  @ApiOperation({
+    summary: 'Download file from server',
+    description: 'Download a file from the server (configs, mods, logs, etc.).',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'File downloaded successfully',
+    content: {
+      'application/octet-stream': {
+        schema: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid path or access denied' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server or file not found' })
+  async downloadFile(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('path') filePath: string,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    let cleanup: (() => void) | undefined;
+
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Download file
+      const result = await this.fileManagementService.downloadFile(id, filePath);
+      cleanup = result.cleanup;
+
+      // Set response headers
+      res.set({
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${result.filename}"`,
+      });
+
+      // Read file and stream it
+      const fs = require('fs');
+      const fileStream = fs.createReadStream(result.localPath);
+
+      // Clean up after streaming completes
+      fileStream.on('end', () => {
+        if (cleanup) cleanup();
+      });
+
+      fileStream.on('error', () => {
+        if (cleanup) cleanup();
+      });
+
+      return new StreamableFile(fileStream);
+    } catch (error) {
+      // Clean up on error
+      if (cleanup) cleanup();
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Read file content for editing
+   * GET /servers/:id/files/content
+   */
+  @Get(':id/files/content')
+  @ApiOperation({
+    summary: 'Read file content',
+    description: 'Read the content of a text-based file for editing (configs, logs, etc.).',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'File content retrieved successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          content: 'server-port=25565\nmax-players=20',
+          filename: 'server.properties',
+        },
+        messages: [],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid path or file type not editable' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server or file not found' })
+  async readFileContent(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('path') filePath: string,
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Read file content
+      const result = await this.fileManagementService.readFileContent(id, filePath);
+      return ResponseHelper.success(result);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Write file content (save edits)
+   * PUT /servers/:id/files/content
+   */
+  @Throttle({ short: { limit: 20, ttl: 60000 } }) // 20 saves per minute
+  @Put(':id/files/content')
+  @ApiOperation({
+    summary: 'Save file content',
+    description: 'Save edited content to a text-based file (configs, etc.).',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'File saved successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          message: 'File saved successfully',
+        },
+        messages: ['File saved successfully'],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Invalid path or file type not editable' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server or file not found' })
+  async writeFileContent(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Body() body: { path: string; content: string },
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Validate body
+      if (!body.path || body.content === undefined) {
+        return ResponseHelper.error(['Path and content are required']);
+      }
+
+      // Write file content
+      const result = await this.fileManagementService.writeFileContent(
+        id,
+        body.path,
+        body.content,
+      );
+      return ResponseHelper.success(result, [result.message]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
    * Delete a file from the server
    * DELETE /servers/:id/files
    */
+  @Throttle({ short: { limit: 15, ttl: 60000 } }) // 15 deletions per minute
   @Delete(':id/files')
   @ApiOperation({
     summary: 'Delete file from server',
@@ -509,6 +683,175 @@ export class ServersController {
 
       // Delete file
       const result = await this.fileManagementService.deleteFile(id, filePath);
+      return ResponseHelper.success(result, [result.message]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Get server performance metrics
+   * GET /servers/:id/metrics
+   */
+  @Get(':id/metrics')
+  @ApiOperation({
+    summary: 'Get server performance metrics',
+    description: 'Get CPU, memory, disk usage, and player count for a specific server.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Server metrics retrieved successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          cpuUsage: 45.2,
+          memoryUsedMb: 2048,
+          memoryAllocatedMb: 4096,
+          memoryUsagePercent: 50,
+          diskUsedGb: 2.5,
+          diskTotalGb: 50,
+          diskUsagePercent: 5,
+          uptimeSeconds: 3600,
+          activePlayers: 5,
+          maxPlayers: 20,
+        },
+        messages: [],
+      },
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server not found' })
+  async getServerMetrics(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Get metrics
+      const metrics = await this.metricsService.getServerMetrics(id);
+      return ResponseHelper.success(metrics);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Reset server world
+   * POST /servers/:id/world/reset
+   */
+  @Throttle({ short: { limit: 3, ttl: 300000 } }) // 3 resets per 5 minutes
+  @Post(':id/world/reset')
+  @ApiOperation({
+    summary: 'Reset server world',
+    description: 'Delete world folders to generate a fresh world. Server must be stopped.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'World reset successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          message: 'World reset successfully. A new world will be generated on next server start.',
+        },
+        messages: ['World reset successfully. A new world will be generated on next server start.'],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Server is running or invalid request' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server not found' })
+  async resetWorld(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @Query('type') worldType: 'overworld' | 'nether' | 'end' | 'all' = 'all',
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Reset world
+      const result = await this.fileManagementService.resetWorld(id, worldType);
+      return ResponseHelper.success(result, [result.message]);
+    } catch (error) {
+      return ResponseHelper.error([error.message]);
+    }
+  }
+
+  /**
+   * Upload custom world
+   * POST /servers/:id/world/upload
+   */
+  @Throttle({ short: { limit: 3, ttl: 300000 } }) // 3 uploads per 5 minutes
+  @Post(':id/world/upload')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: diskStorage({
+        destination: './uploads',
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+          cb(null, uniqueSuffix + '-' + file.originalname);
+        },
+      }),
+      limits: {
+        fileSize: 500 * 1024 * 1024, // 500MB for world files
+      },
+      fileFilter: (req, file, cb) => {
+        if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
+          cb(null, true);
+        } else {
+          cb(new Error('Only ZIP files are allowed'), false);
+        }
+      },
+    }),
+  )
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: 'Upload custom world',
+    description: 'Upload a custom world as a ZIP file. Server must be stopped. Max file size: 500MB.',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'World uploaded successfully',
+    schema: {
+      example: {
+        isSuccess: true,
+        value: {
+          message: 'World uploaded successfully. Start the server to use the new world.',
+        },
+        messages: ['World uploaded successfully. Start the server to use the new world.'],
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'Server is running, invalid file, or upload failed' })
+  @ApiResponse({ status: 401, description: 'Unauthorized - Invalid or missing JWT token' })
+  @ApiResponse({ status: 404, description: 'Server not found' })
+  async uploadWorld(
+    @CurrentUser('id') userId: string,
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File,
+    @Query('type') worldType: 'overworld' | 'nether' | 'end' = 'overworld',
+  ) {
+    try {
+      // Verify ownership
+      await this.serversService.findOne(userId, id);
+
+      // Upload world
+      const result = await this.fileManagementService.uploadWorld(id, file, worldType);
       return ResponseHelper.success(result, [result.message]);
     } catch (error) {
       return ResponseHelper.error([error.message]);
